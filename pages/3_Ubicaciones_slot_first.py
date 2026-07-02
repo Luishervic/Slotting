@@ -94,6 +94,83 @@ def _from_fabric(objects, largo_m, ancho_m, scale, originales):
             "prioridad": base.get("prioridad")})
     return out
 
+
+# --------------------------------------------------------------------------- #
+# Cuadrícula tipo Excel: 1 celda = 1 ubicación; token del tipo, "X" = obstáculo
+# --------------------------------------------------------------------------- #
+def _tokens_tipos(tipos):
+    """Asigna un token (letra) único a cada tipo. 'X' queda reservado."""
+    usados, out = {"X"}, {}
+    for t in tipos:
+        base = (str(t["tipo"])[:1] or "T").upper()
+        tok, k = base, 2
+        while tok in usados:
+            tok, k = f"{base}{k}", k + 1
+        usados.add(tok)
+        out[t["tipo"]] = tok
+    return out
+
+
+def _grid_desde_estado(slots, obstaculos, nrows, ncols, cw, ch, tok_por_tipo):
+    """Construye la matriz de tokens desde el estado actual (fila 0 = fondo)."""
+    g = [["" for _ in range(ncols)] for _ in range(nrows)]
+    for s in slots:
+        col = int(round(s["x"] / cw))
+        row = nrows - 1 - int(round(s["y"] / ch))
+        if 0 <= row < nrows and 0 <= col < ncols:
+            g[row][col] = tok_por_tipo.get(
+                s.get("tipo"), (str(s.get("tipo") or "U")[:1] or "U").upper())
+    for o in obstaculos or []:
+        c0 = max(0, int(round(o["x"] / cw)))
+        c1 = min(ncols, int(round((o["x"] + o["w"]) / cw)))
+        r0 = max(0, int(round(o["y"] / ch)))
+        r1 = min(nrows, int(round((o["y"] + o["d"]) / ch)))
+        for fy in range(r0, max(r0 + 1, r1)):
+            row = nrows - 1 - fy
+            if 0 <= row < nrows:
+                for col in range(c0, max(c0 + 1, c1)):
+                    if col < ncols:
+                        g[row][col] = "X"
+    return g
+
+
+def _aplicar_grid(valores, nrows, ncols, cw, ch, tipos_by_token):
+    """Convierte la matriz editada en (ubicaciones, obstáculos).
+
+    Cada celda con token = 1 ubicación del tamaño de la celda con los
+    metadatos de su tipo. Las 'X' contiguas por fila se funden en un obstáculo.
+    """
+    slots_out, obst_out, n = [], [], 0
+    for row in range(nrows):
+        y = (nrows - 1 - row) * ch
+        col = 0
+        while col < ncols:
+            tok = str(valores[row][col] or "").strip().upper()
+            if tok == "X":
+                fin = col
+                while fin + 1 < ncols and \
+                        str(valores[row][fin + 1] or "").strip().upper() == "X":
+                    fin += 1
+                obst_out.append({"nombre": f"obs{len(obst_out)+1}",
+                                 "x": round(col * cw, 2), "y": round(y, 2),
+                                 "w": round((fin - col + 1) * cw, 2),
+                                 "d": round(ch, 2), "tipo": "zona_bloqueada"})
+                col = fin + 1
+                continue
+            if tok:
+                t = tipos_by_token.get(tok, {})
+                n += 1
+                slots_out.append({
+                    "id": f"U{n}", "tipo": t.get("tipo", tok),
+                    "zona": t.get("zona"),
+                    "x": round(col * cw, 2), "y": round(y, 2),
+                    "w": round(cw, 2), "d": round(ch, 2),
+                    "niveles": t.get("niveles"), "familia": t.get("familia"),
+                    "prioridad": None})
+            col += 1
+    return slots_out, obst_out
+
+
 st.set_page_config(page_title="Ubicaciones (slot-first)", page_icon="📍",
                    layout="wide")
 st.title("📍 Ubicaciones primero (slot-first)")
@@ -297,6 +374,53 @@ with st.expander("📐 Definir ubicaciones", expanded=not st.session_state["slot
                 st.rerun()
         else:
             st.info("Define un tipo arriba para poder rellenar una región.")
+
+    # Cuadrícula tipo Excel.
+    with st.container(border=True):
+        st.markdown("**🔢 Cuadrícula tipo Excel** — 1 celda = 1 ubicación. "
+                    "Escribe la **letra del tipo** en la celda, **X** = "
+                    "obstáculo, vacío = pasillo. Funciona copiar/pegar rangos "
+                    "(Ctrl+C/V, incluso desde Excel). Fila de abajo = frente.")
+        gc1, gc2, gc3 = st.columns([1, 1, 2])
+        gcw = gc1.number_input("Ancho de celda (m)", 0.5, 20.0, 3.0, 0.5,
+                               key="gcw")
+        gch = gc2.number_input("Largo de celda (m)", 0.5, 20.0, 2.0, 0.5,
+                               key="gch")
+        ncols = max(1, int(ancho // gcw))
+        nrows = max(1, int(largo // gch))
+        tok_por_tipo = _tokens_tipos(tipos_list)
+        tipos_by_token = {tok_por_tipo[t["tipo"]]: t for t in tipos_list}
+        gc3.caption("Tokens: " + " · ".join(
+            f"**{tok_por_tipo[t['tipo']]}** = {t['tipo']} "
+            f"({t['ancho']:.1f}×{t['largo']:.1f})" for t in tipos_list)
+            + " · **X** = obstáculo" if tipos_list else "Define tipos arriba.")
+        if nrows * ncols > 2600:
+            st.warning(f"Cuadrícula de {nrows}×{ncols} celdas es demasiado "
+                       "grande; sube el tamaño de celda.")
+        else:
+            gseed = pd.DataFrame(
+                _grid_desde_estado(st.session_state["slots"],
+                                   st.session_state["obstaculos"],
+                                   nrows, ncols, gcw, gch, tok_por_tipo),
+                columns=[f"{c * gcw:.0f}" for c in range(ncols)],
+                index=[f"y{(nrows - 1 - r) * gch:.0f}" for r in range(nrows)],
+            ).astype("object")
+            gedit = st.data_editor(
+                gseed, width='stretch',
+                key=f"grid_editor_{st.session_state['slots_rev']}_{gcw}_{gch}",
+                column_config={c: st.column_config.TextColumn(c, width="small")
+                               for c in gseed.columns})
+            if st.button("✅ Aplicar cuadrícula (reemplaza ubicaciones y "
+                         "obstáculos)", type="primary", key="grid_apply"):
+                ns, no = _aplicar_grid(gedit.values.tolist(), nrows, ncols,
+                                       gcw, gch, tipos_by_token)
+                st.session_state["slots"] = ns
+                st.session_state["obstaculos"] = no
+                st.session_state["slots_rev"] += 1
+                st.session_state["obs_rev"] += 1
+                st.toast(f"Cuadrícula aplicada: {len(ns)} ubicaciones, "
+                         f"{len(no)} obstáculos")
+                st.rerun()
 
     # Subir CSV.
     with st.container(border=True):
