@@ -399,7 +399,7 @@ with t2d:
     modo = st.radio(
         "Acción en el plano:",
         ["👁️ Ver", "🖐️ Arrastrar (lienzo)", "➕ Crear ubicación",
-         "↔️ Mover (clic y clic)", "🧱 Agregar obstáculo"],
+         "↔️ Mover (flechas)", "🧱 Agregar obstáculo"],
         horizontal=True, key="plano_modo")
 
     if st.session_state.get("move_msg"):
@@ -409,24 +409,28 @@ with t2d:
     # Acomodo asistido: compactar contra contornos (otras ubicaciones,
     # obstáculos y bordes), estilo gravedad. Elimina huecos sin solapar.
     if ids_actuales:
-        cb1, cb2, cb3, _ = st.columns([1, 1, 1, 2])
+        cb1, cb2, cb3, cb4 = st.columns([1, 1, 1, 1])
+        gap_filas = cb4.number_input(
+            "Gap mínimo entre filas (m)", 0.0, 5.0, 0.0, 0.1, key="gap_filas",
+            help="Separación que la compactación deja entre contornos "
+                 "(p. ej. 3.5 para conservar pasillos).")
         if cb1.button("⬇️ Compactar al frente", width='stretch',
                       help="Desliza cada ubicación hacia Y=0 hasta topar."):
             st.session_state["slots"] = S.compactar(
                 st.session_state["slots"], st.session_state["obstaculos"],
-                ancho, largo, "frente")
+                ancho, largo, "frente", gap=gap_filas)
             st.session_state["slots_rev"] += 1
             st.rerun()
         if cb2.button("⬅️ Compactar a la izquierda", width='stretch'):
             st.session_state["slots"] = S.compactar(
                 st.session_state["slots"], st.session_state["obstaculos"],
-                ancho, largo, "izquierda")
+                ancho, largo, "izquierda", gap=gap_filas)
             st.session_state["slots_rev"] += 1
             st.rerun()
         if cb3.button("↙️ Compactar ambos", width='stretch'):
             st.session_state["slots"] = S.compactar(
                 st.session_state["slots"], st.session_state["obstaculos"],
-                ancho, largo, "ambos")
+                ancho, largo, "ambos", gap=gap_filas)
             st.session_state["slots_rev"] += 1
             st.rerun()
 
@@ -484,83 +488,80 @@ with t2d:
                    "el acomodo se recalcula al aplicar.")
 
     elif modo.startswith("↔️"):
-        # ---- Mover por clic: clic(s) en ubicaciones para TOMAR grupo, clic
-        #      en destino para mover todas (con límite por contornos). ----
+        # ---- Mover con FLECHAS: selección + botones; tope exacto en contornos.
+        #      Simple (sin arrastres frágiles) y robusto (cálculo exacto). ----
         if not ids_actuales:
             st.info("Aún no hay ubicaciones para mover.")
             st.plotly_chart(viz.plano_2d(res, color_por), width='stretch')
         else:
-            grabbed = list(st.session_state["grabbed"])   # lista de ids
-            limitar = st.checkbox("🚧 Limitar por contornos (no solapar)",
-                                  value=True, key="click_limitar")
-            fig = viz.plano_2d(res, color_por, con_hover=False)
-            fig.add_trace(go.Scatter(
-                x=[s["x"] + s["w"] / 2 for s in slots_list],
-                y=[s["y"] + s["d"] / 2 for s in slots_list],
-                mode="markers",
-                marker=dict(size=13, line=dict(width=1.5, color="white"),
-                            color=["#e11" if s["id"] in grabbed else "#0a7"
-                                   for s in slots_list]),
-                customdata=[[s["id"]] for s in slots_list],
-                hovertext=[s["id"] for s in slots_list], hoverinfo="text",
-                showlegend=False))
-            if grabbed:
-                gx = np.arange(0.5, ancho, 0.5)
-                gy = np.arange(0.5, largo, 0.5)
-                GX, GY = np.meshgrid(gx, gy)
-                fig.add_trace(go.Scattergl(
-                    x=GX.ravel(), y=GY.ravel(), mode="markers",
-                    marker=dict(size=3, color="rgba(30,120,255,0.30)"),
-                    customdata=[["__grid__"]] * GX.size, hoverinfo="skip",
-                    showlegend=False))
-                st.info(f"✋ Tomadas **{len(grabbed)}** ({', '.join(grabbed)}). "
-                        "Clic en más puntos verdes para sumar al grupo, o clic en "
-                        "el **destino** (rejilla) para mover todas juntas.")
-                if st.button("✖️ Cancelar selección"):
-                    st.session_state["grabbed"] = []
+            sc1, sc2 = st.columns([3, 2])
+            seleccion = sc1.multiselect(
+                "Ubicaciones a mover (grupo)", ids_actuales, key="mover_sel")
+            criterios = sorted({str(s.get(k)) for s in slots_list
+                                for k in ("tipo", "zona") if s.get(k)})
+            rapido = sc2.selectbox("➕ Sumar por tipo/zona", [""] + criterios,
+                                   key="mover_rapido")
+            if rapido:
+                extra = [s["id"] for s in slots_list
+                         if str(s.get("tipo")) == rapido
+                         or str(s.get("zona")) == rapido]
+                nueva = sorted(set(seleccion) | set(extra))
+                if nueva != sorted(seleccion):
+                    st.session_state["mover_sel"] = nueva
+                    st.session_state["mover_rapido"] = ""
                     st.rerun()
+
+            p1, p2, p3 = st.columns(3)
+            paso = p1.number_input("Paso (m)", 0.1, 20.0, 1.0, 0.1, key="mv_paso")
+            gap_mv = p2.number_input("Gap al topar (m)", 0.0, 5.0, 0.0, 0.1,
+                                     key="mv_gap")
+            topar = p3.toggle("🧲 Hasta topar", value=False, key="mv_topar",
+                              help="Ignora el paso: desliza hasta el primer "
+                                   "contacto con otra ubicación/obstáculo/borde.")
+
+            def _mover(dx, dy):
+                nuevos, aplicado = S.mover_grupo(
+                    st.session_state["slots"], seleccion, dx, dy,
+                    st.session_state["obstaculos"], ancho, largo,
+                    gap=gap_mv, hasta_topar=topar)
+                st.session_state["slots"] = nuevos
+                st.session_state["slots_rev"] += 1
+                st.session_state["move_msg"] = (
+                    f"↔️ Movidas {len(seleccion)} ubicación(es) "
+                    f"{aplicado:.2f} m" if aplicado > 0 else
+                    "🚧 Sin espacio: ya están pegadas al contorno.")
+                st.rerun()
+
+            if seleccion:
+                f1, f2, f3, f4, _ = st.columns([1, 1, 1, 1, 3])
+                if f1.button("⬅️", width='stretch'):
+                    _mover(-paso, 0)
+                if f2.button("➡️", width='stretch'):
+                    _mover(paso, 0)
+                if f3.button("⬆️ (fondo)", width='stretch'):
+                    _mover(0, paso)
+                if f4.button("⬇️ (frente)", width='stretch'):
+                    _mover(0, -paso)
             else:
-                st.info("👆 Clic en uno o varios **puntos verdes** para tomar el "
-                        "grupo; luego clic en el destino.")
-            ev = st.plotly_chart(fig, width='stretch',
-                                 key=f"move_sel_{'-'.join(grabbed) or 'none'}",
-                                 on_select="rerun", selection_mode="points")
-            pts = ((ev or {}).get("selection") or {}).get("points") or []
-            if pts:
-                cd = pts[0].get("customdata")
-                if cd and cd[0] == "__grid__" and grabbed:
-                    # Mover el grupo: el ancla (1er tomado) va al destino; el resto
-                    # se traslada el mismo delta. Luego se resuelven solapes.
-                    ancla = next(s for s in slots_list if s["id"] == grabbed[0])
-                    dx = pts[0]["x"] - (ancla["x"] + ancla["w"] / 2)
-                    dy = pts[0]["y"] - (ancla["y"] + ancla["d"] / 2)
-                    nuevos = []
-                    for s in st.session_state["slots"]:
-                        if s["id"] in grabbed:
-                            s = {**s,
-                                 "x": min(max(0.0, s["x"] + dx), ancho - s["w"]),
-                                 "y": min(max(0.0, s["y"] + dy), largo - s["d"])}
-                        nuevos.append(s)
-                    if limitar:
-                        previos = {s["id"]: s for s in slots_list}
-                        nuevos, conf = S.resolver_movimientos(
-                            nuevos, previos, st.session_state["obstaculos"],
-                            ancho, largo)
-                        st.session_state["move_msg"] = (
-                            f"🚧 {len(conf)} ajustada(s) por solape: {conf}"
-                            if conf else None)
-                    st.session_state["slots"] = nuevos
-                    st.session_state["grabbed"] = []
-                    st.session_state["slots_rev"] += 1
-                    st.rerun()
-                elif cd and cd[0] != "__grid__":
-                    gid = cd[0]
-                    if gid in grabbed:
-                        grabbed.remove(gid)
-                    else:
-                        grabbed.append(gid)
-                    st.session_state["grabbed"] = grabbed
-                    st.rerun()
+                st.info("Elige una o varias ubicaciones (o súmalas por "
+                        "tipo/zona) y usa las flechas. El movimiento se "
+                        "detiene solo al tocar un contorno.")
+
+            fig = viz.plano_2d(res, color_por, con_hover=False)
+            sel_set = set(seleccion)
+            marcados = [s for s in slots_list if s["id"] in sel_set]
+            if marcados:
+                xs, ys = [], []
+                for s in marcados:
+                    xs += [s["x"], s["x"] + s["w"], s["x"] + s["w"], s["x"],
+                           s["x"], None]
+                    ys += [s["y"], s["y"], s["y"] + s["d"], s["y"] + s["d"],
+                           s["y"], None]
+                fig.add_trace(go.Scatter(
+                    x=xs, y=ys, mode="lines",
+                    line=dict(color="#e11", width=3), name="selección",
+                    hoverinfo="skip"))
+            st.plotly_chart(fig, width='stretch')
 
     elif not modo.startswith("👁️"):
         # ---- Crear / Obstáculo: arrastrar un rectángulo. ----

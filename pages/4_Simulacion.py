@@ -69,6 +69,13 @@ with st.sidebar:
     seed = st.number_input("Semilla aleatoria", 0, 9999, 42, 1)
 
     st.header("Operación")
+    modo_ruta = st.radio(
+        "Modelo de recorrido",
+        ["pasillos", "manhattan"],
+        format_func={"pasillos": "🛣️ Por pasillos (esquiva estantes)",
+                     "manhattan": "📏 Manhattan simple (rápido)"}.get,
+        help="Por pasillos: el camino rodea ubicaciones y obstáculos sobre una "
+             "malla de 0.5 m (más preciso, tarda unos segundos más).")
     vel = st.slider("Velocidad de recorrido (m/s)", 0.3, 3.0, 1.0, 0.1)
     t_pick = st.slider("Tiempo por pick (s)", 5.0, 300.0, 45.0, 5.0)
     t_fijo = st.slider("Tiempo fijo por pedido (s)", 0.0, 600.0, 120.0, 10.0)
@@ -81,10 +88,11 @@ with st.sidebar:
 cfg_sim = SIM.SimConfig(
     n_pedidos=int(n_ped), lineas_media=lineas, velocidad_mps=vel,
     t_pick_s=t_pick, t_fijo_s=t_fijo, depot_x=dep_x, depot_y=dep_y,
-    seed=int(seed),
+    seed=int(seed), modo_ruta=modo_ruta,
     pesos_abc={"A": wa, "B": wb, "C": wc, "D": wd, "E": wd})
 
-out = SIM.simular(df, res_aco, cfg_sim)
+with st.spinner("Simulando recorridos…"):
+    out = SIM.simular(df, res_aco, cfg_sim)
 k = out["kpis"]
 
 # --------------------------------------------------------------------------- #
@@ -116,18 +124,27 @@ with t_ruta:
         fila = out["pedidos"].iloc[sel - 1]
         st.caption(f"Pedido {sel}: **{int(fila['lineas'])} líneas**, "
                    f"**{fila['dist_m']:.0f} m**, **{fila['t_min']:.1f} min** "
-                   "(ruta vecino-más-cercano, distancia Manhattan).")
+                   + ("— camino real por pasillos."
+                      if ruta.get("poly") else
+                      "— trayecto Manhattan simplificado."))
         fig = viz.plano_2d(res_aco, "familia", con_hover=False)
-        # Trayecto en L (Manhattan): tramo X y luego tramo Y entre paradas.
-        rx, ry = [], []
         cs = ruta["coords"]
-        for a, b in zip(cs[:-1], cs[1:]):
-            rx += [a[0], b[0], b[0], None]
-            ry += [a[1], a[1], b[1], None]
-        fig.add_trace(go.Scatter(x=rx, y=ry, mode="lines",
-                                 line=dict(color="#e11", width=2.5),
-                                 name="recorrido", hoverinfo="skip"))
-        paradas = cs[1:-1]
+        if ruta.get("poly"):
+            # Camino real por pasillos (ya viene con todas las esquinas).
+            fig.add_trace(go.Scatter(
+                x=[p[0] for p in cs], y=[p[1] for p in cs], mode="lines",
+                line=dict(color="#e11", width=2.5),
+                name="recorrido", hoverinfo="skip"))
+        else:
+            # Trayecto en L (Manhattan): tramo X y luego tramo Y entre paradas.
+            rx, ry = [], []
+            for a, b in zip(cs[:-1], cs[1:]):
+                rx += [a[0], b[0], b[0], None]
+                ry += [a[1], a[1], b[1], None]
+            fig.add_trace(go.Scatter(x=rx, y=ry, mode="lines",
+                                     line=dict(color="#e11", width=2.5),
+                                     name="recorrido", hoverinfo="skip"))
+        paradas = ruta.get("paradas") or cs[1:-1]
         fig.add_trace(go.Scatter(
             x=[p[0] for p in paradas], y=[p[1] for p in paradas],
             mode="markers+text", text=[str(i + 1) for i in range(len(paradas))],

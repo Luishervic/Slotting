@@ -331,6 +331,52 @@ def compactar(slots_list, obstaculos, ancho, largo, hacia="frente",
     return out
 
 
+def mover_grupo(slots_list, ids, dx, dy, obstaculos, ancho, largo,
+                gap=0.0, hasta_topar=False) -> tuple[list[dict], float]:
+    """Mueve un GRUPO de ubicaciones rígidamente en un eje (dx o dy, no ambos)
+    deteniéndose EXACTAMENTE al tocar un contorno: otra ubicación, un obstáculo
+    o el borde del área. `hasta_topar=True` ignora la magnitud y desliza hasta
+    el primer contacto. Devuelve (lista_nueva, desplazamiento_aplicado)."""
+    ids = set(ids)
+    sel = [s for s in slots_list if s["id"] in ids]
+    fijos = ([s for s in slots_list if s["id"] not in ids]
+             + [dict(o) for o in (obstaculos or [])])
+    if not sel or (not dx and not dy):
+        return slots_list, 0.0
+    eje, delta = ("x", dx) if dx else ("y", dy)
+    permitido = float("inf") if hasta_topar else abs(delta)
+    positivo = delta > 0
+
+    for s in sel:
+        if eje == "x":
+            lo, hi, tam = s["y"], s["y"] + s["d"], s["w"]
+            pos0, borde = s["x"], ancho
+        else:
+            lo, hi, tam = s["x"], s["x"] + s["w"], s["d"]
+            pos0, borde = s["y"], largo
+        # Borde del área.
+        permitido = min(permitido,
+                        (borde - (pos0 + tam)) if positivo else pos0)
+        # Contornos fijos que se cruzan en el eje perpendicular.
+        for f in fijos:
+            f_lo, f_hi = (f["y"], f["y"] + f["d"]) if eje == "x" else \
+                         (f["x"], f["x"] + f["w"])
+            if f_hi <= lo + 1e-9 or f_lo >= hi - 1e-9:
+                continue   # no se cruzan: no bloquea
+            f_pos, f_tam = (f["x"], f["w"]) if eje == "x" else (f["y"], f["d"])
+            if positivo and f_pos >= pos0 + tam - 1e-9:
+                permitido = min(permitido, f_pos - (pos0 + tam) - gap)
+            elif not positivo and f_pos + f_tam <= pos0 + 1e-9:
+                permitido = min(permitido, pos0 - (f_pos + f_tam) - gap)
+
+    permitido = max(0.0, 0.0 if permitido == float("inf") else permitido)
+    out = [dict(s) for s in slots_list]
+    for s in out:
+        if s["id"] in ids:
+            s[eje] = round(s[eje] + (permitido if positivo else -permitido), 2)
+    return out, permitido
+
+
 def resolver_movimientos(slots_nuevos, previos_by_id, obstaculos, ancho, largo):
     """Impide solapes: las ubicaciones que NO se movieron quedan fijas (ancla);
     las movidas se empujan contra contornos (obstáculos y demás). Si una no cabe,
