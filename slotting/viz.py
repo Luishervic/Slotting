@@ -6,6 +6,7 @@ para que el render sea fluido aunque haya más de mil pilas.
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import plotly.colors as pc
 import plotly.graph_objects as go
 
@@ -33,11 +34,24 @@ def _hex_to_rgb(h):
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
 
+def _ubic_repetidas(res: dict, min_ubic: int = 2) -> set:
+    """IDs de ubicaciones que contienen algún SKU repartido en `min_ubic` o
+    más ubicaciones (umbral configurable de posible sobre-stock)."""
+    asig = res.get("asignaciones")
+    if asig is None or len(asig) == 0:
+        return set()
+    por_sku = asig.groupby("sku")["ubicacion"].nunique()
+    skus = set(por_sku[por_sku >= max(2, int(min_ubic))].index)
+    if not skus:
+        return set()
+    return set(asig[asig["sku"].isin(skus)]["ubicacion"])
+
+
 # --------------------------------------------------------------------------- #
 # 2D — plano del piso
 # --------------------------------------------------------------------------- #
 def plano_2d(res: dict, color_por: str = "familia",
-             con_hover: bool = True) -> go.Figure:
+             con_hover: bool = True, umbral_repetidas: int = 2) -> go.Figure:
     """Plano 2D a escala. Cada categoría es UNA traza con rectángulos rellenos
     separados por NaN (rápido de construir y de renderizar; evita el O(n²) de
     miles de `add_shape`). `con_hover=False` omite la capa de puntos de hover
@@ -61,19 +75,38 @@ def plano_2d(res: dict, color_por: str = "familia",
             text=o.get("nombre", "obst"), showarrow=False,
             font=dict(size=9, color="white")))
 
-    # Ubicaciones (slot-first): contorno punteado + etiqueta; rojo si vacía.
+    # Ubicaciones (slot-first): contorno punteado si vacía; morado = multi-SKU;
+    # fondo ámbar = contiene un SKU repartido en >= umbral ubicaciones. El
+    # ámbar va en layer="below" para NO lavar los colores por clase/familia
+    # de las piezas, que se dibujan encima.
+    repetidas = _ubic_repetidas(res, umbral_repetidas)
     for s in res.get("slots", []) or []:
         vacia = not s.get("sku_asignado")
+        rep = s.get("id") in repetidas
+        color = "#96f" if s.get("multisku") else ("#888" if vacia else "#0a7")
         shapes.append(dict(
             type="rect", x0=s["x"], y0=s["y"],
             x1=s["x"] + s["w"], y1=s["y"] + s["d"],
-            line=dict(color="#888" if vacia else "#0a7", width=1.5,
+            line=dict(color=color, width=1.5,
                       dash="dot" if vacia else "solid"),
             fillcolor="rgba(0,0,0,0)", layer="above"))
+        if rep:
+            shapes.append(dict(
+                type="rect", x0=s["x"], y0=s["y"],
+                x1=s["x"] + s["w"], y1=s["y"] + s["d"],
+                line=dict(width=0),
+                fillcolor="rgba(255,170,0,0.35)", layer="below"))
         annotations.append(dict(
             x=s["x"] + s["w"] / 2, y=s["y"] + s["d"] - 0.25,
-            text=f"{s.get('id', '')}<br>{s['w']:.1f}×{s['d']:.1f} m",
+            text=f"{s.get('id', '')}{' ↔' if rep else ''}"
+                 f"<br>{s['w']:.1f}×{s['d']:.1f} m",
             showarrow=False, font=dict(size=8, color="#066"), align="center"))
+    if repetidas:   # entrada de leyenda para el resaltado
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker=dict(size=10, symbol="square",
+                        color="rgba(255,170,0,0.45)"),
+            name="↔ SKU en varias ubicaciones"))
 
     if pos is not None and not pos.empty:
         cats = pos[color_por].fillna("(s/d)")
@@ -116,50 +149,50 @@ def plano_2d(res: dict, color_por: str = "familia",
 # 3D — pilas extruidas
 # --------------------------------------------------------------------------- #
 def vista_3d(res: dict, color_por: str = "familia",
-             mostrar_unidades: bool = True) -> go.Figure:
+             mostrar_unidades: bool = True,
+             umbral_repetidas: int = 2) -> go.Figure:
     cfg = res["config"]
     pos = res["posiciones"]
+    if pos is None:
+        pos = pd.DataFrame()
     fig = go.Figure()
-    if pos is None or pos.empty:
-        fig.update_layout(title="Sin posiciones colocadas")
-        return fig
 
-    cats = pos[color_por].fillna("(s/d)")
-    paleta = _paleta(cats.unique())
+    if not pos.empty:
+        cats = pos[color_por].fillna("(s/d)")
+        paleta = _paleta(cats.unique())
 
-    xs, ys, zs = [], [], []
-    i_idx, j_idx, k_idx = [], [], []
-    vcolors = []
-    hover = []
-    base = 0
-    for _, p in pos.iterrows():
-        x0, x1 = p["x"], p["x"] + p["w_x"]
-        y0, y1 = p["y"], p["y"] + p["d_y"]
-        z0, z1 = 0.0, max(p["altura_m"], 0.05)
-        verts = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
-                 (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
-        for vx, vy, vz in verts:
-            xs.append(vx); ys.append(vy); zs.append(vz)
-        for a, b, c in _FACES:
-            i_idx.append(base + a); j_idx.append(base + b); k_idx.append(base + c)
-        rgb = _hex_to_rgb(paleta.get(p[color_por] if p[color_por] else "(s/d)",
-                                     "#888888"))
-        col = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
-        vcolors.extend([col] * 8)
-        hover.extend([f"SKU {p['sku']}<br>{p.get('familia','')}<br>"
-                      f"{int(p['unidades'])} u · {int(p['niveles_max'])} niveles<br>"
-                      f"alto {p['altura_m']:.1f} m"] * 8)
-        base += 8
+        xs, ys, zs = [], [], []
+        i_idx, j_idx, k_idx = [], [], []
+        vcolors = []
+        hover = []
+        base = 0
+        for i_p, (_, p) in enumerate(pos.iterrows()):
+            x0, x1 = p["x"], p["x"] + p["w_x"]
+            y0, y1 = p["y"], p["y"] + p["d_y"]
+            z0, z1 = 0.0, max(p["altura_m"], 0.05)
+            verts = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+                     (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
+            for vx, vy, vz in verts:
+                xs.append(vx); ys.append(vy); zs.append(vz)
+            for a, b, c in _FACES:
+                i_idx.append(base + a); j_idx.append(base + b); k_idx.append(base + c)
+            rgb = _hex_to_rgb(paleta.get(cats.iloc[i_p], "#888888"))
+            col = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+            vcolors.extend([col] * 8)
+            hover.extend([f"SKU {p['sku']}<br>{p.get('familia','')}<br>"
+                          f"{int(p['unidades'])} u · {int(p['niveles_max'])} niveles<br>"
+                          f"alto {p['altura_m']:.1f} m"] * 8)
+            base += 8
 
-    fig.add_trace(go.Mesh3d(
-        x=xs, y=ys, z=zs, i=i_idx, j=j_idx, k=k_idx,
-        vertexcolor=vcolors, opacity=1.0, flatshading=True,
-        hovertext=hover, hoverinfo="text", name="pilas",
-    ))
+        fig.add_trace(go.Mesh3d(
+            x=xs, y=ys, z=zs, i=i_idx, j=j_idx, k=k_idx,
+            vertexcolor=vcolors, opacity=1.0, flatshading=True,
+            hovertext=hover, hoverinfo="text", name="pilas",
+        ))
 
     # Bordes blancos por UNIDAD: contorno de cada pieza apilada para
     # diferenciar visualmente unidad de unidad.
-    if mostrar_unidades:
+    if mostrar_unidades and not pos.empty:
         lx, ly, lz = [], [], []
         for _, p in pos.iterrows():
             x0, x1 = p["x"], p["x"] + p["w_x"]
@@ -181,6 +214,58 @@ def vista_3d(res: dict, color_por: str = "familia",
             x=lx, y=ly, z=lz, mode="lines",
             line=dict(color="white", width=1.5),
             hoverinfo="skip", showlegend=False, name="unidades"))
+
+    # Contornos de las UBICACIONES sobre el piso (mismo código de color que
+    # el plano 2D) + parche ámbar bajo las que comparten un SKU repartido.
+    repetidas = _ubic_repetidas(res, umbral_repetidas)
+    grupos: dict = {}
+    for s in res.get("slots", []) or []:
+        if s.get("multisku"):
+            g = ("Ubicación multi-SKU", "#96f")
+        elif s.get("sku_asignado"):
+            g = ("Ubicación ocupada", "#0a7")
+        else:
+            g = ("Ubicación vacía", "#888")
+        grupos.setdefault(g, []).append(s)
+    zs_ub = 0.02   # apenas sobre el piso para evitar parpadeo (z-fighting)
+    for (nombre, color), ss_g in grupos.items():
+        lx, ly = [], []
+        for s in ss_g:
+            x0, x1 = s["x"], s["x"] + s["w"]
+            y0, y1 = s["y"], s["y"] + s["d"]
+            lx += [x0, x1, x1, x0, x0, np.nan]
+            ly += [y0, y0, y1, y1, y0, np.nan]
+        fig.add_trace(go.Scatter3d(
+            x=lx, y=ly, z=[zs_ub] * len(lx), mode="lines",
+            line=dict(color=color, width=4),
+            hoverinfo="skip", name=nombre, showlegend=True))
+    slots_l = res.get("slots", []) or []
+    reps = [s for s in slots_l if s.get("id") in repetidas]
+    if reps:
+        vx, vy, vz, ii, jj, kk = [], [], [], [], [], []
+        for m, s in enumerate(reps):
+            x0, x1 = s["x"], s["x"] + s["w"]
+            y0, y1 = s["y"], s["y"] + s["d"]
+            vx += [x0, x1, x1, x0]; vy += [y0, y0, y1, y1]
+            vz += [0.015] * 4
+            b = 4 * m
+            ii += [b, b]; jj += [b + 1, b + 2]; kk += [b + 2, b + 3]
+        fig.add_trace(go.Mesh3d(
+            x=vx, y=vy, z=vz, i=ii, j=jj, k=kk,
+            color="#fa0", opacity=0.3, flatshading=True,
+            hoverinfo="skip", name="↔ SKU en varias ubicaciones",
+            showlegend=True))
+    if slots_l:   # centro de cada ubicación: hover con id y contenido
+        fig.add_trace(go.Scatter3d(
+            x=[s["x"] + s["w"] / 2 for s in slots_l],
+            y=[s["y"] + s["d"] / 2 for s in slots_l],
+            z=[zs_ub] * len(slots_l), mode="markers",
+            marker=dict(size=3, color="rgba(0,0,0,0)"),
+            hovertext=[f"{s.get('id', '')} · "
+                       f"{s.get('sku_asignado') or 'vacía'}"
+                       + (" · ↔ repartido" if s.get("id") in repetidas else "")
+                       for s in slots_l],
+            hoverinfo="text", showlegend=False, name="ubicaciones"))
 
     # Obstáculos como columnas oscuras (altura = altura libre a techo).
     for o in res.get("obstaculos", []) or []:

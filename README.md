@@ -42,19 +42,39 @@ streamlit run app.py
 ```
 app.py                          Entrada Streamlit (carga + panorama)
 pages/
-  1_Validacion_de_datos.py      Validación / limpieza (Fase 1)
-  2_Acomodo_y_3D.py             Acomodo automático + plano 2D + visor 3D
-  3_Ubicaciones_slot_first.py   Definir ubicaciones y autodistribuir (slot-first)
-  4_Simulacion.py               Simulación de pickeo y recorridos (KPIs)
+  1_Validacion_de_datos.py      Validación / limpieza
+  2_Layout.py                   Diseño automático + edición 2D (bloques) + 3D
+  3_Simulacion.py               Simulación de pickeo y recorridos (KPIs)
 slotting/                       Lógica de negocio (sin dependencia de UI)
   io.py                         Carga + normalización al esquema canónico
   validation.py                 Reglas de detección y corrección
-  layout.py                     Motor de acomodo automático (block stacking)
-  slots.py                      Motor slot-first (ubicaciones dedicadas)
-  sim.py                        Simulador de pedidos/rutas (demanda sintética ABC)
+  slots.py                      Motor slot-first: propuesta, multi-SKU, edición
+  sim.py                        Simulador de pedidos/rutas (por pasillos)
   viz.py                        Figuras Plotly 2D/3D
+  layout.py                     (legado) block stacking por bahías
 Ubicaciones_Piso.csv            Datos de ejemplo (sección Piso)
 ```
+
+## Flujo de trabajo
+
+1. **Validación** — limpia volumetría/pesos.
+2. **Layout** — el sistema propone tipos de ubicación con tamaño óptimo y
+   acomoda por familia (las de más SKUs A en las cabeceras). La **cuadrícula**
+   editable queda **precargada** con ese diseño automático: cada celda es una
+   ubicación (`COD`, `COD=2.5x1.2` para dimensiones propias, sufijo `*` =
+   multi-SKU) y los **pasillos** son filas `P<ancho>` (`P3.5`; `P0` = hileras
+   pegadas) ajustables una por una. Los tamaños se ajustan **por tipo** en la
+   tabla junto a la cuadrícula (aplica a todas las celdas de ese código;
+   botón "📐 Aplicar" re-tila el layout vigente). Se edita como en Excel
+   (copiar/pegar) y se reconstruye con **Construir**; la **zona especial**
+   tiene su propia cuadrícula equivalente. Una ubicación **multi-SKU** acepta
+   cuantos SKUs/unidades quepan en ella (empaque por carriles); las demás se
+   dedican a un solo SKU. El plano 2D/3D resalta en ámbar (↔) las ubicaciones
+   con un SKU repartido en ≥ N ubicaciones (umbral configurable); esos SKUs
+   pueden **limitarse por sobre-stock**: conservan N−1 ubicaciones en el piso
+   y solo su **excedente** de unidades pasa a la zona especial. El 3D dibuja
+   también los contornos de las ubicaciones.
+3. **Simulación** — pickeos y recorridos por pasillos sobre el layout actual.
 
 ## Modelo de acomodo (Fase 2 — sección Piso)
 

@@ -4,7 +4,9 @@ mercancía se distribuye automáticamente en ellas.
 Modelo (acordado con el usuario):
     - Una ubicación es una ZONA/CARRIL rectangular (x, y, ancho, largo) con un
       tope de estiba (`niveles`) y, opcionalmente, una `familia` permitida.
-    - Cada ubicación se DEDICA a un solo SKU; un SKU puede ocupar varias.
+    - Cada ubicación se DEDICA a un solo SKU (un SKU puede ocupar varias),
+      salvo que esté marcada `multisku`: entonces admite cuantos SKUs/unidades
+      quepan, empacados por carriles.
     - Capacidad de una ubicación para un SKU = (piezas a lo ancho) ×
       (piezas a lo largo) × estiba_efectiva, donde estiba_efectiva respeta el
       Max_Estiba del SKU, el tope de la ubicación y la altura libre a techo.
@@ -14,7 +16,8 @@ Modelo (acordado con el usuario):
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pandas as pd
@@ -32,6 +35,9 @@ class SlotConfig:
     respetar_familia: bool = True   # honrar familia permitida de la ubicación
     respetar_zona: bool = False     # honrar zona (tipo de ubicación propuesta A-E)
     gap_m: float = 0.03             # separación entre piezas dentro de la ubicación
+    # Umbral informativo (lo usa la página para separar piso principal vs zona
+    # especial). En `distribuir` una ubicación multi-SKU acepta CUALQUIER SKU.
+    multisku_max_unidades: int = 10
     # Orden de asignación multi-criterio: lista de claves en orden de prioridad.
     # Claves válidas: clase_abc, dcf, familia, zona, volumen, unidades.
     orden: list = field(default_factory=lambda: ["clase_abc", "unidades"])
@@ -108,53 +114,90 @@ def capacidad(slot: dict, sku, cfg: SlotConfig) -> dict:
     return mejor
 
 
-def _expandir(slot, sku, cap, place, cfg, posiciones):
-    """Genera las posiciones (pilas) de `place` unidades dentro de la ubicación."""
-    across, niveles = cap["across"], cap["niveles_ef"]
-    wx, dy = cap["w_x"], cap["d_y"]
-    ground_needed = int(math.ceil(place / niveles))
+def _cap_carriles(slot, sku, cfg) -> dict | None:
+    """Capacidad para `sku` en el ANCHO RESTANTE del slot (empaque por
+    carriles: cada SKU toma carriles completos de una pieza de ancho, así
+    varios SKUs pueden convivir en una ubicación multi-SKU sin encimarse)."""
+    a, b = sku["largo_cm"] / 100.0, sku["ancho_cm"] / 100.0
+    alto = sku["alto_cm"] / 100.0
+    rem_w = slot["w"] - slot.get("_x_usado", 0.0)
+    modos = {"largo_frente": [(a, b)], "ancho_frente": [(b, a)]}.get(
+        cfg.orientacion_pieza, [(a, b), (b, a)])
+    mejor = None
+    for pw, pd_ in modos:
+        lanes = int((rem_w + 1e-9) // (pw + cfg.gap_m))
+        deep = int((slot["d"] + 1e-9) // (pd_ + cfg.gap_m))
+        if lanes * deep <= 0:
+            continue
+        ns = slot.get("niveles")
+        niveles_sku = int(sku.get("max_estiba") or 1)
+        niveles_alto = int(cfg.altura_libre_m // alto) if alto > 0 else niveles_sku
+        if ns in (None, "", 0) or (isinstance(ns, float) and math.isnan(ns)):
+            niveles_ef = max(1, min(niveles_sku, niveles_alto))
+        else:
+            niveles_ef = max(1, min(niveles_sku, int(ns), niveles_alto))
+        cand = {"pw": pw, "pd": pd_, "lanes": lanes, "deep": deep,
+                "niveles_ef": niveles_ef, "units": lanes * deep * niveles_ef,
+                "alto_m": alto,
+                "excede_altura": bool(niveles_ef * alto > cfg.altura_libre_m)}
+        if mejor is None or cand["units"] > mejor["units"]:
+            mejor = cand
+    return mejor
+
+
+def _asignar(slot, sku, cap, place, cfg, posiciones, asignaciones, forzada):
+    """Coloca `place` unidades en los carriles libres del slot y lo registra."""
+    niveles, deep = cap["niveles_ef"], cap["deep"]
+    pw, pd_ = cap["pw"], cap["pd"]
+    x0 = slot["x"] + slot.get("_x_usado", 0.0)
+    ground = int(math.ceil(place / niveles))
+    lanes_usados = int(math.ceil(ground / deep))
     rem = place
-    for k in range(ground_needed):
-        col, row = k % across, k // across
+    for k in range(ground):
+        lane, row = k // deep, k % deep
         u = min(rem, niveles)
         rem -= u
         posiciones.append({
             "sku": sku["sku"], "familia": sku.get("familia"),
             "clase_abc": sku.get("clase_abc"), "ubicacion": slot["id"],
-            "x": slot["x"] + col * (wx + cfg.gap_m),
-            "y": slot["y"] + row * (dy + cfg.gap_m),
-            "w_x": wx, "d_y": dy, "niveles_max": niveles, "unidades": int(u),
+            "x": x0 + lane * (pw + cfg.gap_m),
+            "y": slot["y"] + row * (pd_ + cfg.gap_m),
+            "w_x": pw, "d_y": pd_, "niveles_max": niveles, "unidades": int(u),
             "alto_m": cap["alto_m"], "altura_m": float(u * cap["alto_m"]),
             "excede_altura": cap["excede_altura"],
         })
-
-
-def _asignar(slot, sku, cap, place, cfg, posiciones, asignaciones, forzada):
-    """Registra la asignación de `place` unidades de `sku` a `slot`."""
-    _expandir(slot, sku, cap, place, cfg, posiciones)
     asignaciones.append({
         "ubicacion": slot["id"], "sku": sku["sku"],
         "familia": sku.get("familia"), "clase_abc": sku.get("clase_abc"),
         "unidades": int(place), "capacidad": int(cap["units"]),
         "ocupacion_pct": round(100 * place / cap["units"], 1),
-        "posiciones": int(math.ceil(place / cap["niveles_ef"])),
-        "niveles": int(cap["niveles_ef"]), "forzada": bool(forzada),
+        "posiciones": ground, "niveles": int(niveles),
+        "forzada": bool(forzada),
     })
-    slot["_libre"] = False
+    slot["_x_usado"] = slot.get("_x_usado", 0.0) + lanes_usados * (pw + cfg.gap_m)
+    slot["_skus"] = slot.get("_skus", []) + [str(sku["sku"])]
+    if not slot.get("multisku"):
+        slot["_cerrado"] = True   # mono-SKU: se dedica al primer SKU
 
 
 def distribuir(df_skus: pd.DataFrame, slots: list[dict],
                cfg: SlotConfig | None = None,
-               forzados: dict | None = None) -> dict:
+               forzados: dict | None = None,
+               max_ubic: dict | None = None) -> dict:
     """Asigna SKUs a ubicaciones dedicadas. Devuelve asignaciones, posiciones,
     estado de ubicaciones y KPIs.
 
     forzados: dict {id_ubicacion: sku} para fijar manualmente qué SKU va en qué
     ubicación. Se colocan primero y omiten la restricción de familia (decisión
     explícita del usuario); el resto se autodistribuye alrededor.
+
+    max_ubic: dict {sku: n} — tope de UBICACIONES para ese SKU (control de
+    sobre-stock): conserva hasta n ubicaciones y sus unidades restantes se
+    reportan en `excedentes` (NO en overflow), para acomodarlas en otra zona.
     """
     cfg = cfg or SlotConfig()
     forzados = {str(u): str(s) for u, s in (forzados or {}).items() if s}
+    max_ubic = {str(k): int(v) for k, v in (max_ubic or {}).items()}
     d = df_skus[df_skus.get("unidades", 0).fillna(0) > 0].copy()
     d = _orden_skus(d, cfg)
 
@@ -164,31 +207,33 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
         s.setdefault("niveles", None)   # None = auto (usa Max_Estiba del SKU)
         s["familia"] = s.get("familia") or None
         s["zona"] = s.get("zona") or None
-        s["_libre"] = True
+        s["multisku"] = bool(s.get("multisku"))
+        s["_x_usado"], s["_skus"], s["_cerrado"] = 0.0, [], False
     slots_ord = sorted(slots, key=lambda s: (
         s["prioridad"] if s.get("prioridad") is not None else 1e9,
-                                             s["y"], s["x"]))
+        s["y"], s["x"]))
     slot_by_id = {s["id"]: s for s in slots}
     sku_rows = {str(r["sku"]): r for _, r in d.iterrows()}
     remaining = {str(r["sku"]): int(r["unidades"]) for _, r in d.iterrows()}
 
     asignaciones, posiciones, no_factibles = [], [], []
+    usadas: dict = {}   # nº de ubicaciones ya usadas por SKU (para max_ubic)
 
-    # ---- Pase 0: asignaciones forzadas (prioridad, ignoran familia). ----
+    # ---- Pase 0: asignaciones forzadas (prioridad, ignoran restricciones). --
     for slot_id, sku_id in forzados.items():
         slot = slot_by_id.get(slot_id)
         if slot is None:
             no_factibles.append({"ubicacion": slot_id, "sku": sku_id,
                                  "motivo": "la ubicación ya no existe"}); continue
-        if not slot["_libre"]:
+        if slot["_cerrado"]:
             no_factibles.append({"ubicacion": slot_id, "sku": sku_id,
                                  "motivo": "ubicación ya ocupada por otro fijado"}); continue
         if sku_id not in sku_rows:
             no_factibles.append({"ubicacion": slot_id, "sku": sku_id,
                                  "motivo": "el SKU no existe o no tiene unidades"}); continue
         sku = sku_rows[sku_id]
-        cap = capacidad(slot, sku, cfg)
-        place = min(remaining[sku_id], cap["units"])
+        cap = _cap_carriles(slot, sku, cfg)
+        place = min(remaining[sku_id], cap["units"]) if cap else 0
         if place <= 0:
             no_factibles.append({
                 "ubicacion": slot_id, "sku": sku_id,
@@ -196,16 +241,22 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
                           f"{sku['ancho_cm']:.0f} cm) no entra en la ubicación "
                           f"({slot['w']:.1f}×{slot['d']:.1f} m)"}); continue
         _asignar(slot, sku, cap, place, cfg, posiciones, asignaciones, True)
+        usadas[sku_id] = usadas.get(sku_id, 0) + 1
         remaining[sku_id] -= place
 
-    # ---- Pase 1: autodistribución del resto. ----
+    # ---- Pase 1: autodistribución. Multi-SKU: acepta cualquier SKU y se va
+    # llenando por carriles hasta agotar su capacidad (el usuario decide qué
+    # ubicaciones comparten al marcarlas `multisku`).
     for _, sku in d.iterrows():
         sid = str(sku["sku"])
         rem = remaining[sid]
+        cap_u = max_ubic.get(sid)
         for slot in slots_ord:
             if rem <= 0:
                 break
-            if not slot["_libre"]:
+            if cap_u is not None and usadas.get(sid, 0) >= cap_u:
+                break   # tope de sobre-stock: el resto va a `excedentes`
+            if slot["_cerrado"]:
                 continue
             if (cfg.respetar_familia and slot["familia"]
                     and slot["familia"] != sku.get("familia")):
@@ -213,30 +264,41 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
             if (cfg.respetar_zona and slot.get("zona")
                     and str(slot["zona"]) != str(sku.get("zona_propuesta"))):
                 continue
-            cap = capacidad(slot, sku, cfg)
-            if cap["units"] <= 0:
+            cap = _cap_carriles(slot, sku, cfg)
+            if not cap or cap["units"] <= 0:
                 continue
             place = min(rem, cap["units"])
             _asignar(slot, sku, cap, place, cfg, posiciones, asignaciones, False)
+            usadas[sid] = usadas.get(sid, 0) + 1
             rem -= place
         remaining[sid] = rem
 
-    overflow = [{"sku": s, "familia": sku_rows[s].get("familia"),
-                 "unidades_sin_ubicar": int(rem)}
-                for s, rem in remaining.items() if rem > 0]
+    # Unidades sin colocar: si el SKU fue CORTADO por su tope de ubicaciones
+    # es excedente deliberado (sobre-stock); si no, es overflow real.
+    overflow, excedentes = [], []
+    for s, rem in remaining.items():
+        if rem <= 0:
+            continue
+        if s in max_ubic and usadas.get(s, 0) >= max_ubic[s]:
+            excedentes.append({"sku": s, "familia": sku_rows[s].get("familia"),
+                               "unidades_excedente": int(rem)})
+        else:
+            overflow.append({"sku": s, "familia": sku_rows[s].get("familia"),
+                             "unidades_sin_ubicar": int(rem)})
 
     df_asig = pd.DataFrame(asignaciones)
     df_pos = pd.DataFrame(posiciones)
     df_over = pd.DataFrame(overflow)
+    df_exc = pd.DataFrame(excedentes)
     kpis = _kpis(d, slots, df_asig, df_pos, df_over, cfg)
-    # Estado de ubicaciones (libre/ocupada + por quién).
-    ocupadas = (df_asig.set_index("ubicacion")["sku"].to_dict()
-                if not df_asig.empty else {})
+    # Estado de ubicaciones: qué SKU(s) contiene cada una.
     for s in slots:
-        s["sku_asignado"] = ocupadas.get(s["id"])
-        s.pop("_libre", None)
+        s["sku_asignado"] = ", ".join(s["_skus"]) if s["_skus"] else None
+        s["n_skus"] = len(s["_skus"])
+        for k in ("_x_usado", "_skus", "_cerrado"):
+            s.pop(k, None)
     return {"asignaciones": df_asig, "posiciones": df_pos, "overflow": df_over,
-            "kpis": kpis, "config": cfg, "slots": slots,
+            "excedentes": df_exc, "kpis": kpis, "config": cfg, "slots": slots,
             "forzados_no_factibles": no_factibles}
 
 
@@ -512,3 +574,414 @@ def slots_desde_grid(cfg: SlotConfig, slot_w: float, slot_d: float,
                 _add(x, y); x += slot_w
             y += slot_d + pasillo_m
     return slots
+
+
+# --------------------------------------------------------------------------- #
+# Diseño automático: tipos de ubicación con tamaño óptimo + acomodo familia/ABC
+# --------------------------------------------------------------------------- #
+def calcular_tipos_optimos(df, n_tipos: int = 4, gap_m: float = 0.03,
+                           deep_max_pd_m: float = 1.4) -> list[dict]:
+    """Deriva automáticamente `n_tipos` TIPOS de ubicación (cada uno con su
+    propio ancho/largo) a partir del catálogo de piezas del inventario.
+
+    En vez de una sola dimensión "talla única" para todo, agrupa las piezas
+    por su fondo (profundidad) en `n_tipos` grupos con demanda de posiciones
+    similar (piezas chicas y de poca demanda quedan en un grupo, piezas
+    grandes/voluminosas en otro, etc.) y calcula, PARA CADA GRUPO, el tamaño
+    que mejor le queda: la ubicación se dimensiona para que cubra de forma
+    DEDICADA la demanda típica (mediana de nº de posiciones) de un SKU de ese
+    tamaño — así se minimiza tanto el espacio desperdiciado como que un SKU
+    quede partido entre varias ubicaciones. Con `n_tipos=1` se obtiene una
+    única talla estándar (equivalente al modo simple anterior).
+
+    Piezas con fondo <= `deep_max_pd_m` usan doble fondo (2 posiciones a lo
+    largo de la ubicación); piezas más profundas usan fondo simple.
+
+    Devuelve una lista de dicts (uno por tipo, ordenados de menor a mayor):
+    codigo, tipo, w, d, niveles(None=auto), familia(None), multisku(False),
+    cap_loc, n_skus, n_pos_cubiertas — pensada para mostrarse como tabla
+    editable (el usuario puede ajustar w/d/niveles a mano si lo prefiere).
+    """
+    d = df[df.get("unidades", 0).fillna(0) > 0].copy()
+    if d.empty:
+        return []
+    me = pd.to_numeric(d["max_estiba"], errors="coerce").replace(0, np.nan).fillna(1)
+    d["n_pos"] = np.ceil(pd.to_numeric(d["unidades"], errors="coerce") / me).astype(int)
+    l = pd.to_numeric(d["largo_cm"], errors="coerce") / 100.0
+    a = pd.to_numeric(d["ancho_cm"], errors="coerce") / 100.0
+    d["pw"] = np.minimum(l, a)   # frente (lado menor, orientación auto)
+    d["pd"] = np.maximum(l, a)   # fondo
+
+    n_tipos = max(1, int(n_tipos))
+    d = d.sort_values("pd", kind="stable").reset_index(drop=True)
+    peso = d["n_pos"].clip(lower=1)
+    frac = peso.cumsum() / peso.sum()
+    d["tipo_idx"] = np.minimum(n_tipos - 1, (frac * n_tipos).astype(int))
+
+    letras = [chr(65 + i) for i in range(n_tipos)]
+    tipos = []
+    for i in range(n_tipos):
+        g = d[d["tipo_idx"] == i]
+        if g.empty:
+            continue
+        pw_r = float(g["pw"].median())
+        pd_r = float(g["pd"].median())
+        pos_tipico = max(1, int(round(g["n_pos"].median())))
+        deep = 2 if pd_r <= deep_max_pd_m else 1
+        lanes = max(1, math.ceil(pos_tipico / deep))
+        w_loc = round(lanes * (pw_r + gap_m) + 0.05, 2)
+        d_loc = round(deep * (pd_r + gap_m) + 0.05, 2)
+        cap_loc = lanes * deep
+        n_pos_g = int(g["n_pos"].sum())
+        tipos.append({
+            "codigo": letras[i], "tipo": f"Tipo {letras[i]}",
+            "w": w_loc, "d": d_loc, "niveles": None,
+            "familia": None, "multisku": False,
+            "cap_loc": cap_loc, "n_skus": int(g["sku"].nunique()),
+            "n_pos_cubiertas": n_pos_g,
+        })
+    return tipos
+
+
+def _elegir_tipo(pw: float, pdd: float, tipos_ord: list[dict], gap_m: float) -> str:
+    """Elige, de menor a mayor área, el primer tipo donde la pieza quepa
+    (al menos 1 carril x 1 de fondo). Si no cabe en ninguno, usa el mayor."""
+    for t in tipos_ord:
+        lanes = math.floor((t["w"] + 1e-9) / (pw + gap_m))
+        deep = math.floor((t["d"] + 1e-9) / (pdd + gap_m))
+        if lanes >= 1 and deep >= 1:
+            return t["codigo"]
+    return tipos_ord[-1]["codigo"]
+
+
+def _proponer_core(df, cfg: SlotConfig, pasillo_m: float, tipos: list[dict],
+                   umbral_multisku: int, obstaculos: list[dict]) -> dict:
+    gap_m = 0.03
+    d = df[df.get("unidades", 0).fillna(0) > 0].copy()
+    me = pd.to_numeric(d["max_estiba"], errors="coerce").replace(0, np.nan).fillna(1)
+    d["n_pos"] = np.ceil(pd.to_numeric(d["unidades"], errors="coerce") / me).astype(int)
+    l = pd.to_numeric(d["largo_cm"], errors="coerce") / 100.0
+    a = pd.to_numeric(d["ancho_cm"], errors="coerce") / 100.0
+    d["pw"] = np.minimum(l, a)
+    d["pd"] = np.maximum(l, a)
+
+    tipo_by_code = {str(t["codigo"]): t for t in tipos}
+    tipos_ord = sorted(tipos, key=lambda t: t["w"] * t["d"])
+    d["tipo_codigo"] = [_elegir_tipo(r.pw, r.pd, tipos_ord, gap_m) for r in d.itertuples()]
+
+    chicos = d[d["unidades"] <= umbral_multisku]
+    grandes = d[d["unidades"] > umbral_multisku]
+
+    filas = []
+    for (fam, tcode), g in d.groupby(["familia", "tipo_codigo"], dropna=False):
+        t = tipo_by_code[tcode]
+        g_gra = grandes[(grandes["familia"] == fam) & (grandes["tipo_codigo"] == tcode)]
+        g_chi = chicos[(chicos["familia"] == fam) & (chicos["tipo_codigo"] == tcode)]
+        pw_r, pd_r = float(g["pw"].median()), float(g["pd"].median())
+        cap_loc = max(1, int(t["w"] // (pw_r + gap_m)) * int(t["d"] // (pd_r + gap_m)))
+        locs_mono = int(np.ceil(g_gra["n_pos"] / cap_loc).sum()) if len(g_gra) else 0
+        locs_multi = int(math.ceil(g_chi["n_pos"].sum() / cap_loc)) if len(g_chi) else 0
+        if locs_mono == 0 and locs_multi == 0:
+            continue
+        filas.append({
+            "familia": fam, "tipo_codigo": tcode, "tipo": t.get("tipo", tcode),
+            "w": t["w"], "d": t["d"],
+            "skus": int(g["sku"].nunique()), "skus_A": int((g["clase_abc"] == "A").sum()),
+            "ubic_mono": locs_mono, "ubic_multi": locs_multi,
+            "ubicaciones": locs_mono + locs_multi, "cap_loc": cap_loc,
+        })
+    resumen = pd.DataFrame(filas)
+    if resumen.empty:
+        return {"slots": [], "resumen": resumen,
+                "meta": {"total": 0, "sin_espacio": 0, "tipos": tipos}}
+
+    # Familias con más SKUs A primero (cabeceras); dentro de cada familia, los
+    # tipos más chicos primero (rotación alta cerca del frente).
+    fam_orden = (resumen.groupby("familia")
+                 .agg(skus_A=("skus_A", "sum"), ubicaciones=("ubicaciones", "sum"))
+                 .sort_values(["skus_A", "ubicaciones"], ascending=False).index.tolist())
+    resumen["_fam_rank"] = resumen["familia"].map({f: i for i, f in enumerate(fam_orden)})
+    resumen["_area"] = resumen["w"] * resumen["d"]
+    resumen = (resumen.sort_values(["_fam_rank", "_area"])
+               .drop(columns=["_fam_rank", "_area"]).reset_index(drop=True))
+
+    obst = obstaculos or []
+    slots, sin_espacio, n = [], 0, 0
+    y_cursor = 0.5
+    for _, f in resumen.iterrows():
+        fam, tcode = f["familia"], f["tipo_codigo"]
+        w_loc, d_loc = float(f["w"]), float(f["d"])
+        niveles_t = tipo_by_code[tcode].get("niveles")
+        pref = str(tcode)[:2].upper()
+        for multis, cnt in ((False, int(f["ubic_mono"])), (True, int(f["ubic_multi"]))):
+            if cnt <= 0:
+                continue
+            x, y = 0.5, y_cursor
+            y_ult = None   # última fila donde de verdad se colocó algo
+            for _i in range(cnt):
+                colocada = False
+                while y + d_loc <= cfg.largo_m - 0.5 + 1e-9:
+                    if x + w_loc > cfg.ancho_m - 0.5 + 1e-9:
+                        x, y = 0.5, y + d_loc + pasillo_m
+                        continue
+                    cand = {"x": x, "y": y, "w": w_loc, "d": d_loc}
+                    if (any(_solapan(cand, o) for o in obst)
+                            or any(_solapan(cand, s, 1e-6) for s in slots)):
+                        x += w_loc
+                        continue
+                    n += 1
+                    etiqueta = f["tipo"] + (f" · {fam}" if pd.notna(fam) else "") \
+                        + (" multi" if multis else "")
+                    slots.append({
+                        "id": f"{pref}{n}", "tipo": etiqueta, "zona": None,
+                        "familia": fam if pd.notna(fam) else None,
+                        "multisku": multis, "x": round(x, 2), "y": round(y, 2),
+                        "w": w_loc, "d": d_loc, "niveles": niveles_t,
+                        "prioridad": None, "tipo_codigo": tcode,
+                    })
+                    x += w_loc
+                    y_ult = y
+                    colocada = True
+                    break
+                if not colocada:
+                    sin_espacio += 1
+            # Avanzar el cursor SOLO en función de la última fila realmente
+            # ocupada; antes, si un grupo agotaba el espacio con x reseteada en
+            # 0.5, el cursor no avanzaba y el siguiente grupo se dibujaba
+            # ENCIMA de las ubicaciones ya colocadas.
+            if y_ult is not None:
+                y_cursor = y_ult + d_loc + pasillo_m
+
+    meta = {"total": len(slots), "sin_espacio": sin_espacio, "tipos": tipos,
+            "umbral_multisku": umbral_multisku}
+    return {"slots": slots, "resumen": resumen, "meta": meta}
+
+
+def proponer_layout(df, cfg: SlotConfig, pasillo_m: float = 3.5,
+                    tipos: list[dict] | None = None,
+                    w_loc: float | None = None, d_loc: float | None = None,
+                    n_objetivo: int | None = None,
+                    umbral_multisku: int = 10,
+                    obstaculos: list[dict] | None = None,
+                    orientacion_pasillo: str = "horizontal") -> dict:
+    """Propone un layout completo de ubicaciones a partir de uno o varios
+    TIPOS estandarizados (ver `calcular_tipos_optimos`).
+
+    - `tipos`: catálogo de tipos [{"codigo","w","d","niveles",...}, ...]. Si se
+      omite, se arma uno solo a partir de `w_loc`/`d_loc` (o derivado de
+      `n_objetivo`, compatibilidad con el modo simple anterior).
+    - Cada SKU se asigna al tipo más chico donde su pieza quepa (menos
+      desperdicio); SKUs con más de `umbral_multisku` unidades → ubicaciones
+      MONO-SKU, el resto se agrupa en ubicaciones MULTI-SKU por familia.
+    - Las familias se colocan JUNTAS, en filas frente→fondo, ordenadas por su
+      nº de SKUs clase A (las de más A toman las cabeceras/frente); dentro de
+      cada familia, los tipos más chicos primero.
+    - `orientacion_pasillo`: "horizontal" (pasillos separan filas apiladas en
+      Y, por defecto) o "vertical" (pasillos separan columnas apiladas en X):
+      rota el acomodo 90° manteniendo la misma lógica.
+    Devuelve {"slots", "resumen", "meta"}.
+    """
+    if not tipos:
+        if w_loc is None or d_loc is None:
+            d0 = df[df.get("unidades", 0).fillna(0) > 0]
+            me0 = pd.to_numeric(d0["max_estiba"], errors="coerce").replace(0, np.nan).fillna(1)
+            n_pos0 = np.ceil(pd.to_numeric(d0["unidades"], errors="coerce") / me0).astype(int)
+            pw0 = float(np.median(np.minimum(d0["largo_cm"], d0["ancho_cm"])) / 100.0)
+            pd0 = float(np.median(np.maximum(d0["largo_cm"], d0["ancho_cm"])) / 100.0)
+            n_obj = max(1, int(n_objetivo or 1))
+            cap_obj = max(1, math.ceil(int(n_pos0.sum()) / n_obj))
+            deep = 2 if cap_obj >= 2 else 1
+            lanes = max(1, math.ceil(cap_obj / deep))
+            w_loc = w_loc or round(lanes * (pw0 + 0.03) + 0.05, 2)
+            d_loc = d_loc or round(deep * (pd0 + 0.03) + 0.05, 2)
+        tipos = [{"codigo": "U", "tipo": "Estándar", "w": w_loc, "d": d_loc,
+                 "niveles": None}]
+
+    tipos = [dict(t) for t in tipos]
+    for t in tipos:
+        t.setdefault("codigo", "U")
+        t["w"], t["d"] = float(t["w"]), float(t["d"])
+
+    vertical = orientacion_pasillo == "vertical"
+    if vertical:
+        cfg_c = replace(cfg, largo_m=cfg.ancho_m, ancho_m=cfg.largo_m)
+        obst_c = [{**o, "x": o["y"], "y": o["x"], "w": o["d"], "d": o["w"]}
+                  for o in (obstaculos or [])]
+    else:
+        cfg_c, obst_c = cfg, (obstaculos or [])
+
+    out = _proponer_core(df, cfg_c, pasillo_m, tipos, umbral_multisku, obst_c)
+
+    if vertical and out["slots"]:
+        out["slots"] = [{**s, "x": s["y"], "y": s["x"], "w": s["d"], "d": s["w"]}
+                        for s in out["slots"]]
+
+    resumen = out["resumen"]
+    out["meta"].update({
+        "orientacion_pasillo": orientacion_pasillo,
+        "n_tipos": len(tipos),
+        "w_loc": tipos[0]["w"], "d_loc": tipos[0]["d"],
+        "cap_loc": int(resumen["cap_loc"].iloc[0]) if not resumen.empty else 0,
+    })
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Cuadrícula simple: cada celda = una ubicación (copiar/pegar tipo Excel)
+# --------------------------------------------------------------------------- #
+def slots_desde_cuadricula(grid, catalogo: dict, pasillo_m: float = 3.5,
+                           orientacion: str = "horizontal"
+                           ) -> tuple[list[dict], set]:
+    """Construye ubicaciones a partir de una cuadrícula sencilla tipo hoja de
+    cálculo: cada FILA es un pasillo (bahía) y cada celda no vacía coloca, en
+    orden de izquierda a derecha, una ubicación del TIPO cuyo código escribió
+    el usuario en esa celda (celda vacía = hueco/pasillo). Pensada para
+    construirse copiando/pegando bloques de celdas (Ctrl+C/Ctrl+V), sin tocar
+    coordenadas.
+
+    grid: DataFrame (o lista de listas) de strings con los códigos. Sintaxis
+      de celda: `COD[=ANCHOxLARGO][*]` —
+        - "A"          ubicación del tipo A con sus dimensiones de catálogo.
+        - "A=2.5x1.2"  tipo A pero con dimensiones PROPIAS (2.5 m × 1.2 m);
+                       conserva niveles/familia del tipo. También "A:2,5x1,2".
+        - "Z=3x2"      código desconocido CON dimensiones = ubicación ad-hoc.
+        - sufijo "*"   marca la ubicación como MULTI-SKU (p. ej. "A*",
+                       "A=2.5x1.2*").
+    PASILLOS: una fila cuyo contenido es "P" (o "P3.5" / "P 3,5" para dar el
+      ancho en metros) representa un PASILLO configurable entre hileras; el
+      código "P" queda reservado. Si la cuadrícula trae al menos una fila "P",
+      el modo es EXPLÍCITO: las hileras consecutivas sin "P" quedan espalda
+      con espalda (doble fondo) y los pasillos solo existen donde se escriben.
+      Sin filas "P" se conserva el modo clásico: `pasillo_m` entre cada hilera.
+    catalogo: dict código -> {"w","d","niveles","familia","multisku","tipo"}.
+    orientacion: "horizontal" (filas apiladas en Y) | "vertical" (rota 90°:
+      cada fila de la cuadrícula se vuelve una columna apilada en X).
+    Devuelve (slots, códigos_no_reconocidos).
+    """
+    filas = grid.values.tolist() if hasattr(grid, "values") else grid
+    filas_celdas = []
+    for fila in filas:
+        celdas = [str(c).strip() for c in fila
+                 if str(c).strip() and str(c).strip().lower() != "nan"]
+        if celdas:
+            filas_celdas.append(celdas)
+    explicito = any(_ancho_pasillo(c, pasillo_m) is not None
+                    for c in filas_celdas)
+    desconocidos: set = set()
+    slots, n = [], 0
+    y = 0.5
+    for celdas in filas_celdas:
+        ancho_p = _ancho_pasillo(celdas, pasillo_m)
+        if ancho_p is not None:
+            y += ancho_p
+            continue
+        x, max_d = 0.5, 0.0
+        for celda in celdas:
+            multis = celda.endswith("*")
+            codigo, w_o, d_o = _parse_celda(celda.rstrip("*").strip())
+            t = catalogo.get(codigo)
+            if t is None and w_o is None:
+                desconocidos.add(celda)
+                continue
+            t = t or {}
+            w = float(w_o if w_o is not None else t["w"])
+            dd = float(d_o if d_o is not None else t["d"])
+            n += 1
+            slots.append({
+                "id": f"{codigo}{n}", "tipo": t.get("tipo", codigo),
+                "tipo_codigo": codigo,
+                "familia": t.get("familia") or None,
+                "multisku": multis or bool(t.get("multisku")),
+                "x": round(x, 2), "y": round(y, 2),
+                "w": w, "d": dd, "niveles": t.get("niveles"), "prioridad": None,
+            })
+            x += w
+            max_d = max(max_d, dd)
+        y += max_d + (0.0 if explicito else pasillo_m)
+    if orientacion == "vertical":
+        slots = [{**s, "x": s["y"], "y": s["x"], "w": s["d"], "d": s["w"]}
+                 for s in slots]
+    return slots, desconocidos
+
+
+_RE_PASILLO = re.compile(r"^[Pp]\s*[:=]?\s*(\d+(?:[.,]\d+)?)?$")
+_RE_DIMS = re.compile(r"^(?P<cod>.*?)\s*[:=]\s*(?P<w>\d+(?:[.,]\d+)?)"
+                      r"\s*[xX×]\s*(?P<d>\d+(?:[.,]\d+)?)$")
+
+
+def _parse_celda(cuerpo: str) -> tuple[str, float | None, float | None]:
+    """Separa una celda `COD[=WxD]` en (código, w, d); w/d None si no trae
+    dimensiones propias."""
+    m = _RE_DIMS.match(cuerpo)
+    if m:
+        return (m.group("cod").strip(),
+                float(m.group("w").replace(",", ".")),
+                float(m.group("d").replace(",", ".")))
+    return cuerpo, None, None
+
+
+def _ancho_pasillo(celdas: list[str], default: float) -> float | None:
+    """Si TODAS las celdas no vacías de la fila son códigos de pasillo
+    ("P", "P3.5", "P 3,5", "P=2"...), devuelve su ancho en metros (el primero
+    con número, o `default` si solo hay "P"). Si no, devuelve None."""
+    ms = [_RE_PASILLO.match(c) for c in celdas]
+    if not celdas or not all(ms):
+        return None
+    for m in ms:
+        if m.group(1):
+            return float(m.group(1).replace(",", "."))
+    return default
+
+
+def cuadricula_desde_slots(slots: list[dict], orientacion: str = "horizontal",
+                           catalogo: dict | None = None) -> pd.DataFrame:
+    """Inversa de `slots_desde_cuadricula`: reconstruye la cuadrícula de
+    códigos a partir de las ubicaciones actuales (p. ej. las del diseño
+    automático), agrupando por bandas en Y (cada banda = una hilera).
+    Las ubicaciones multi-SKU llevan el sufijo '*'. Entre hilera e hilera se
+    inserta una fila de PASILLO ("P<ancho>", p. ej. "P3.5") con la separación
+    real, editable celda por celda. Si se pasa `catalogo` (código -> tipo),
+    las ubicaciones cuyas dimensiones difieren de su tipo (o de código
+    desconocido) se emiten como "COD=WxD" para conservar su tamaño real.
+    Sirve para PRECARGAR la cuadrícula editable con el layout propuesto y
+    ajustarlo a mano."""
+    if not slots:
+        return pd.DataFrame()
+    ss = list(slots)
+    if orientacion == "vertical":
+        ss = [{**s, "x": s["y"], "y": s["x"], "w": s["d"], "d": s["w"]}
+              for s in ss]
+    # bandas: [y_inicio, y_fin_max, códigos]
+    bandas: list[list] = []
+    for s in sorted(ss, key=lambda t: (round(float(t["y"]), 2),
+                                       round(float(t["x"]), 2))):
+        cod = s.get("tipo_codigo")
+        if not cod:   # slots antiguos sin código: derivarlo del prefijo del id
+            cod = str(s.get("id", "?")).rstrip("0123456789") or "?"
+        cod = str(cod)
+        if catalogo is not None:   # dims propias si difieren del tipo
+            t = catalogo.get(cod)
+            w, dd = float(s["w"]), float(s["d"])
+            try:
+                igual = (abs(w - float(t["w"])) <= 0.01
+                         and abs(dd - float(t["d"])) <= 0.01)
+            except (TypeError, ValueError, KeyError):
+                igual = False
+            if not igual:
+                cod += f"={round(w, 2):g}x{round(dd, 2):g}"
+        cod += "*" if s.get("multisku") else ""
+        if not bandas or float(s["y"]) > bandas[-1][0] + 0.01:
+            bandas.append([float(s["y"]), float(s["y"]), []])
+        bandas[-1][1] = max(bandas[-1][1], float(s["y"]) + float(s["d"]))
+        bandas[-1][2].append(cod)
+    filas: list[list[str]] = []
+    fin_prev = None
+    for y0, y_fin, cods in bandas:
+        if fin_prev is not None:   # pasillo explícito entre hileras (P0 = pegadas)
+            gap = max(0.0, round(y0 - fin_prev, 2))
+            filas.append([f"P{gap:g}"])
+        filas.append(cods)
+        fin_prev = y_fin
+    ncols = max(len(f) for f in filas)
+    data = [f + [""] * (ncols - len(f)) for f in filas]
+    return pd.DataFrame(data, columns=[f"c{i+1}" for i in range(ncols)])

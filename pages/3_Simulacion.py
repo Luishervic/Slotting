@@ -1,9 +1,8 @@
-"""Página 4 — Simulación de pickeo y recorridos.
+"""Página 3 — Simulación de pickeo y recorridos.
 
 Genera pedidos sintéticos (demanda ponderada por clase ABC), simula el
-recorrido de surtido sobre el acomodo actual (slot-first o automático) y
-entrega KPIs de productividad para ajustar los parámetros esenciales
-(velocidad, tiempos de pick, depot, tamaño de pedido, acomodo).
+recorrido de surtido POR PASILLOS sobre el layout actual y entrega KPIs de
+productividad para ajustar los parámetros esenciales.
 """
 import numpy as np
 import pandas as pd
@@ -26,31 +25,25 @@ df = st.session_state["df"]
 # --------------------------------------------------------------------------- #
 # Fuente del acomodo
 # --------------------------------------------------------------------------- #
-fuentes = {}
-# Slot-first se recalcula EN VIVO desde el layout actual (lo que tengas
-# dibujado/movido ahora mismo), sin necesidad de visitar antes la página 3.
+# El layout se recalcula EN VIVO desde lo que tengas en la página Layout
+# (ubicaciones, obstáculos, fijados): cambias algo allá y aquí se refleja.
 if st.session_state.get("slots"):
     cfg_sf = st.session_state.get("cfg_slotfirst") or S.SlotConfig(
         largo_m=st.session_state.get("largo_m", 56.0),
         ancho_m=st.session_state.get("ancho_m", 42.0))
-    res_sf = S.distribuir(df, st.session_state["slots"], cfg_sf,
-                          forzados=st.session_state.get("asig_forzada", {}))
-    res_sf["obstaculos"] = st.session_state.get("obstaculos", [])
-    fuentes["📍 Slot-first (layout actual)"] = res_sf
+    res_aco = S.distribuir(df, st.session_state["slots"], cfg_sf,
+                           forzados=st.session_state.get("asig_forzada", {}),
+                           max_ubic=st.session_state.get("max_ubic_sobrestock"))
+    res_aco["obstaculos"] = st.session_state.get("obstaculos", [])
 elif st.session_state.get("res_slotfirst") is not None:
-    fuentes["📍 Slot-first (último visto)"] = st.session_state["res_slotfirst"]
-if st.session_state.get("res_acomodo") is not None:
-    fuentes["🏗️ Acomodo automático"] = st.session_state["res_acomodo"]
-
-if not fuentes:
-    st.info("Aún no hay un acomodo para simular. Define ubicaciones en "
-            "**📍 Ubicaciones (slot-first)** (o visita **🏗️ Acomodo y 3D**) "
-            "y regresa aquí.")
+    res_aco = st.session_state["res_slotfirst"]
+else:
+    st.info("Aún no hay un layout que simular. Ve a **🏗️ Layout**, genera o "
+            "dibuja tus ubicaciones y regresa aquí.")
     st.stop()
 
-fuente = st.radio("Acomodo a simular:", list(fuentes), horizontal=True)
-res_aco = fuentes[fuente]
 cfg_aco = res_aco["config"]
+st.caption("Simulando sobre el **layout actual** (página 🏗️ Layout).")
 
 # --------------------------------------------------------------------------- #
 # Parámetros de la simulación
