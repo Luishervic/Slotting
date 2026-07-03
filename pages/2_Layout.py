@@ -167,6 +167,12 @@ with st.sidebar:
              "el piso principal: se agrupan en la 🗃️ Zona especial (más abajo), "
              "con su propia área y ubicaciones compartidas.")
     resp_fam = st.toggle("Familias juntas (respetar familia)", value=True)
+    max_skus_multi = st.slider(
+        "Máx. SKUs por ubicación multi-SKU", 0, 30, 0, 1,
+        help="Tope de SKUs DISTINTOS que puede contener una ubicación "
+             "multi-SKU (0 = sin límite). Al llegar al tope, los siguientes "
+             "SKUs buscan otra ubicación. Aplica al piso principal y a la "
+             "🗃️ Zona especial.")
     ORDEN_LABELS = {"clase_abc": "Clase (ABC)", "dcf": "DCF",
                     "familia": "Familia", "volumen": "Volumen",
                     "unidades": "Inventario"}
@@ -185,7 +191,8 @@ with st.sidebar:
 cfg = S.SlotConfig(largo_m=largo, ancho_m=ancho,
                    orden=orden_sel or ["clase_abc", "unidades"],
                    altura_libre_m=altura, respetar_familia=resp_fam,
-                   multisku_max_unidades=int(umbral_viable))
+                   multisku_max_unidades=int(umbral_viable),
+                   multisku_max_skus=int(max_skus_multi) or None)
 
 # SKUs "viables" (>= mínimo) van al piso principal, dedicados; el resto
 # (unidades > 0 pero por debajo del mínimo) se manda a la Zona especial.
@@ -391,11 +398,15 @@ with t2d:
             "propias** (2.5 m de ancho × 1.2 m de largo) — así pruebas "
             "cambios de tamaño puntuales sin tocar el catálogo. Sufijo `*` "
             "(p. ej. `A*` o `A=2.5x1.2*`) = ubicación **multi-SKU** "
-            "(acepta tantos SKUs/unidades como quepan). Una fila con `P` es "
-            "un **pasillo** (`P3.5` = pasillo de 3.5 m; `P` solo = ancho de "
-            "la barra lateral; `P0` = hileras pegadas, doble fondo) — el "
-            "código `P` queda reservado. Si usas filas `P`, los pasillos "
-            "solo existen donde los escribas; sin ellas se separa cada "
+            "(acepta tantos SKUs/unidades como quepan). **Pasillos**: una "
+            "FILA completa con `P` es un pasillo entre hileras (`P3.5` = "
+            "3.5 m; `P` solo = ancho de la barra lateral; `P0` = hileras "
+            "pegadas, doble fondo); una CELDA `P` dentro de una hilera deja "
+            "un **hueco/pasillo a lo ancho** en ese punto (p. ej. "
+            "`A P2 A`) — el código `P` queda reservado. Puedes **agregar o "
+            "borrar filas** directamente en la tabla (＋/🗑) para insertar "
+            "pasillos. Si usas filas `P`, los pasillos entre hileras solo "
+            "existen donde los escribas; sin ellas se separa cada "
             "hilera con el pasillo de la barra lateral. Al **Proponer "
             "layout** la cuadrícula se precarga con el diseño automático "
             "(incluidos sus pasillos) para que solo hagas ajustes. Copia y "
@@ -447,10 +458,18 @@ with t2d:
                                       st.session_state.get("grid_filas", 10), 1)
         n_cols_in = gc2.number_input("Columnas (por pasillo)", 1, 100,
                                      st.session_state.get("grid_cols", 12), 1)
-        if gc3.button("↔️ Redimensionar cuadrícula", width='stretch'):
-            st.session_state["grid_filas"] = int(n_filas_in)
-            st.session_state["grid_cols"] = int(n_cols_in)
-            st.session_state.pop("grid_data", None)
+        if gc3.button("↔️ Redimensionar cuadrícula", width='stretch',
+                     help="Conserva el contenido actual (recorta si achicas)."):
+            nf2, nc2 = int(n_filas_in), int(n_cols_in)
+            nuevo = pd.DataFrame("", index=range(nf2),
+                                 columns=[f"c{i+1}" for i in range(nc2)])
+            g_act = st.session_state.get("grid_data")
+            if g_act is not None and not g_act.empty:
+                fi, co = min(len(g_act), nf2), min(g_act.shape[1], nc2)
+                nuevo.iloc[:fi, :co] = g_act.iloc[:fi, :co].values
+            st.session_state["grid_data"] = nuevo
+            st.session_state["grid_filas"] = nf2
+            st.session_state["grid_cols"] = nc2
             st.session_state["grid_rev"] = st.session_state.get("grid_rev", 0) + 1
             st.rerun()
         st.session_state.setdefault("grid_filas", int(n_filas_in))
@@ -463,7 +482,8 @@ with t2d:
                 "", index=range(nf), columns=[f"c{i+1}" for i in range(nc)])
         grid_edit = st.data_editor(
             st.session_state["grid_data"], width='stretch', hide_index=True,
-            num_rows="fixed", key=f"grid_editor_{st.session_state['grid_rev']}")
+            num_rows="dynamic",
+            key=f"grid_editor_{st.session_state['grid_rev']}")
         st.session_state["grid_data"] = grid_edit
 
         gb1, gb2, gb3 = st.columns(3)
@@ -702,7 +722,8 @@ else:
                               if t.get("w") and t.get("d")]
             cfg_e = S.SlotConfig(largo_m=float(largo_e), ancho_m=float(ancho_e),
                                  altura_libre_m=altura, respetar_familia=False,
-                                 multisku_max_unidades=10**9)
+                                 multisku_max_unidades=10**9,
+                                 multisku_max_skus=int(max_skus_multi) or None)
             prop_e = S.proponer_layout(
                 df_especial, cfg_e, pasillo_m=pasillo_e, tipos=tipos_validos_e,
                 umbral_multisku=10**9, orientacion_pasillo=orientacion)
@@ -719,6 +740,8 @@ else:
     cfg_esp = st.session_state.get("cfg_especial") or S.SlotConfig(
         largo_m=st.session_state["largo_esp_m"], ancho_m=st.session_state["ancho_esp_m"],
         respetar_familia=False, multisku_max_unidades=10**9)
+    # el tope de SKUs por multi-SKU del sidebar aplica EN VIVO también aquí
+    cfg_esp.multisku_max_skus = int(max_skus_multi) or None
     res_esp = S.distribuir(df_especial, slots_esp, cfg_esp)
     res_esp["obstaculos"] = []
 
@@ -758,7 +781,7 @@ else:
                 "", index=range(6), columns=[f"c{i+1}" for i in range(8)])
         grid_esp_edit = st.data_editor(
             st.session_state["grid_esp_data"], width='stretch',
-            hide_index=True, num_rows="fixed",
+            hide_index=True, num_rows="dynamic",
             key=f"grid_esp_editor_{st.session_state['grid_esp_rev']}")
         st.session_state["grid_esp_data"] = grid_esp_edit
 

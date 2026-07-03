@@ -63,13 +63,15 @@ Ubicaciones_Piso.csv            Datos de ejemplo (sección Piso)
    editable queda **precargada** con ese diseño automático: cada celda es una
    ubicación (`COD`, `COD=2.5x1.2` para dimensiones propias, sufijo `*` =
    multi-SKU) y los **pasillos** son filas `P<ancho>` (`P3.5`; `P0` = hileras
-   pegadas) ajustables una por una. Los tamaños se ajustan **por tipo** en la
+   pegadas) ajustables una por una; una celda `P` dentro de una hilera deja
+   un hueco/pasillo a lo ancho en ese punto (`A P2 A`). Los tamaños se ajustan **por tipo** en la
    tabla junto a la cuadrícula (aplica a todas las celdas de ese código;
    botón "📐 Aplicar" re-tila el layout vigente). Se edita como en Excel
    (copiar/pegar) y se reconstruye con **Construir**; la **zona especial**
    tiene su propia cuadrícula equivalente. Una ubicación **multi-SKU** acepta
-   cuantos SKUs/unidades quepan en ella (empaque por carriles); las demás se
-   dedican a un solo SKU. El plano 2D/3D resalta en ámbar (↔) las ubicaciones
+   cuantos SKUs/unidades quepan en ella (empaque por carriles), con **tope
+   configurable de SKUs distintos** por ubicación (0 = sin límite); las demás
+   se dedican a un solo SKU. El plano 2D/3D resalta en ámbar (↔) las ubicaciones
    con un SKU repartido en ≥ N ubicaciones (umbral configurable); esos SKUs
    pueden **limitarse por sobre-stock**: conservan N−1 ubicaciones en el piso
    y solo su **excedente** de unidades pasa a la zona especial. El 3D dibuja

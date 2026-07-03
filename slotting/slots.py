@@ -38,6 +38,8 @@ class SlotConfig:
     # Umbral informativo (lo usa la página para separar piso principal vs zona
     # especial). En `distribuir` una ubicación multi-SKU acepta CUALQUIER SKU.
     multisku_max_unidades: int = 10
+    # Tope de SKUs DISTINTOS por ubicación multi-SKU (None/0 = sin límite).
+    multisku_max_skus: int | None = None
     # Orden de asignación multi-criterio: lista de claves en orden de prioridad.
     # Claves válidas: clase_abc, dcf, familia, zona, volumen, unidades.
     orden: list = field(default_factory=lambda: ["clase_abc", "unidades"])
@@ -258,6 +260,9 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
                 break   # tope de sobre-stock: el resto va a `excedentes`
             if slot["_cerrado"]:
                 continue
+            if (slot["multisku"] and cfg.multisku_max_skus
+                    and len(slot["_skus"]) >= int(cfg.multisku_max_skus)):
+                continue   # la multi-SKU ya alcanzó su tope de SKUs distintos
             if (cfg.respetar_familia and slot["familia"]
                     and slot["familia"] != sku.get("familia")):
                 continue
@@ -847,12 +852,15 @@ def slots_desde_cuadricula(grid, catalogo: dict, pasillo_m: float = 3.5,
         - "Z=3x2"      código desconocido CON dimensiones = ubicación ad-hoc.
         - sufijo "*"   marca la ubicación como MULTI-SKU (p. ej. "A*",
                        "A=2.5x1.2*").
-    PASILLOS: una fila cuyo contenido es "P" (o "P3.5" / "P 3,5" para dar el
-      ancho en metros) representa un PASILLO configurable entre hileras; el
-      código "P" queda reservado. Si la cuadrícula trae al menos una fila "P",
-      el modo es EXPLÍCITO: las hileras consecutivas sin "P" quedan espalda
-      con espalda (doble fondo) y los pasillos solo existen donde se escriben.
-      Sin filas "P" se conserva el modo clásico: `pasillo_m` entre cada hilera.
+    PASILLOS (código "P" reservado, "P3.5" / "P 3,5" dan el ancho en metros):
+      - FILA completa de "P" = pasillo entre hileras (corre a lo ancho).
+      - CELDA "P" dentro de una hilera = hueco/pasillo INLINE: desplaza lo
+        que sigue en esa hilera (p. ej. "A P2 A" deja 2 m entre las dos A);
+        con orientación vertical esto produce pasillos horizontales.
+      Si la cuadrícula trae al menos una FILA "P", el modo es EXPLÍCITO: las
+      hileras consecutivas sin "P" quedan espalda con espalda (doble fondo) y
+      los pasillos entre hileras solo existen donde se escriben. Sin filas
+      "P" se conserva el modo clásico: `pasillo_m` entre cada hilera.
     catalogo: dict código -> {"w","d","niveles","familia","multisku","tipo"}.
     orientacion: "horizontal" (filas apiladas en Y) | "vertical" (rota 90°:
       cada fila de la cuadrícula se vuelve una columna apilada en X).
@@ -862,7 +870,8 @@ def slots_desde_cuadricula(grid, catalogo: dict, pasillo_m: float = 3.5,
     filas_celdas = []
     for fila in filas:
         celdas = [str(c).strip() for c in fila
-                 if str(c).strip() and str(c).strip().lower() != "nan"]
+                 if c is not None and str(c).strip()
+                 and str(c).strip().lower() not in ("nan", "none")]
         if celdas:
             filas_celdas.append(celdas)
     explicito = any(_ancho_pasillo(c, pasillo_m) is not None
@@ -877,6 +886,11 @@ def slots_desde_cuadricula(grid, catalogo: dict, pasillo_m: float = 3.5,
             continue
         x, max_d = 0.5, 0.0
         for celda in celdas:
+            m_p = _RE_PASILLO.match(celda)
+            if m_p:   # pasillo INLINE: hueco a lo ancho dentro de la hilera
+                x += (float(m_p.group(1).replace(",", "."))
+                      if m_p.group(1) else pasillo_m)
+                continue
             multis = celda.endswith("*")
             codigo, w_o, d_o = _parse_celda(celda.rstrip("*").strip())
             t = catalogo.get(codigo)
@@ -951,7 +965,7 @@ def cuadricula_desde_slots(slots: list[dict], orientacion: str = "horizontal",
     if orientacion == "vertical":
         ss = [{**s, "x": s["y"], "y": s["x"], "w": s["d"], "d": s["w"]}
               for s in ss]
-    # bandas: [y_inicio, y_fin_max, códigos]
+    # bandas: [y_inicio, y_fin_max, x_fin, códigos]
     bandas: list[list] = []
     for s in sorted(ss, key=lambda t: (round(float(t["y"]), 2),
                                        round(float(t["x"]), 2))):
@@ -971,12 +985,17 @@ def cuadricula_desde_slots(slots: list[dict], orientacion: str = "horizontal",
                 cod += f"={round(w, 2):g}x{round(dd, 2):g}"
         cod += "*" if s.get("multisku") else ""
         if not bandas or float(s["y"]) > bandas[-1][0] + 0.01:
-            bandas.append([float(s["y"]), float(s["y"]), []])
-        bandas[-1][1] = max(bandas[-1][1], float(s["y"]) + float(s["d"]))
-        bandas[-1][2].append(cod)
+            bandas.append([float(s["y"]), float(s["y"]), 0.5, []])
+        b = bandas[-1]
+        gap_x = round(float(s["x"]) - b[2], 2)   # hueco a lo ancho -> celda P
+        if gap_x > 0.01:
+            b[3].append(f"P{gap_x:g}")
+        b[3].append(cod)
+        b[1] = max(b[1], float(s["y"]) + float(s["d"]))
+        b[2] = max(b[2], float(s["x"]) + float(s["w"]))
     filas: list[list[str]] = []
     fin_prev = None
-    for y0, y_fin, cods in bandas:
+    for y0, y_fin, _x_fin, cods in bandas:
         if fin_prev is not None:   # pasillo explícito entre hileras (P0 = pegadas)
             gap = max(0.0, round(y0 - fin_prev, 2))
             filas.append([f"P{gap:g}"])
