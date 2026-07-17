@@ -1,17 +1,23 @@
 """Simulación de pickeo y recorridos sobre un acomodo.
 
-El usuario aún no cuenta con el detalle de salidas por pedido, así que la
-demanda se SINTETIZA a partir de la clase ABC: la probabilidad de que un SKU
-aparezca en un pedido es proporcional a un peso por clase (ajustable). Cuando
-existan salidas reales, `generar_pedidos` puede sustituirse por el histórico
-sin tocar el resto.
+La demanda puede venir de dos fuentes:
+    - SINTÉTICA (`generar_pedidos`): la probabilidad de que un SKU aparezca en
+      un pedido es proporcional a un peso por clase ABC (ajustable) — útil
+      mientras no haya histórico de salidas.
+    - REAL (`pedidos_desde_csv`): convierte un CSV de salidas (una fila = una
+      línea de pedido) en pedidos simulables; `simular(..., pedidos=...)` los
+      recorre tal cual.
 
 Modelo de recorrido:
     - El operador sale del DEPOT (punto configurable, p. ej. el andén), visita
       la ubicación de cada línea del pedido y regresa al depot.
-    - Distancia rectilínea (Manhattan): se camina por pasillos, no en diagonal.
+    - Si hay capacidad por viaje (líneas/unidades), el pedido se parte en
+      varios viajes con retorno al depot; una línea con más unidades que la
+      capacidad genera varias visitas a la misma ubicación.
+    - Distancia por pasillos (BFS sobre malla, esquiva estantes) o Manhattan.
     - Ruta por vecino más cercano (heurística estándar de picking).
-    - Tiempo = distancia/velocidad + t_pick por línea + t_fijo por pedido.
+    - Tiempo = distancia/velocidad + t_fijo por viaje
+      + (t_pick + t_unidad·(cantidad−1)) por línea.
 
 Funciona sobre el resultado de slot-first (`asignaciones`+`slots`) o del
 acomodo automático (`bloques`).
@@ -25,14 +31,22 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from slotting.io import _norm_key
+
 
 @dataclass
 class SimConfig:
     n_pedidos: int = 200
     lineas_media: float = 3.0        # líneas (SKUs) promedio por pedido
+    unidades_media: float = 1.0      # unidades promedio por línea (sintética)
     velocidad_mps: float = 1.0       # velocidad de recorrido (m/s)
     t_pick_s: float = 45.0           # tiempo de pickeo por línea (s)
-    t_fijo_s: float = 120.0          # tiempo fijo por pedido (s)
+    t_pick_unidad_s: float = 0.0     # s extra por unidad adicional en la línea
+    t_fijo_s: float = 120.0          # tiempo fijo por viaje (s)
+    cap_lineas_viaje: int = 0        # máx. líneas por viaje (0 = sin límite)
+    cap_unidades_viaje: float = 0.0  # máx. unidades por viaje (0 = sin límite)
+    n_operadores: int = 1            # operadores disponibles en el turno
+    horas_turno: float = 8.0         # duración del turno (h)
     depot_x: float = 0.0             # posición del andén / punto de salida
     depot_y: float = 0.0
     seed: int = 42
@@ -184,9 +198,10 @@ def sku_positions(res: dict) -> pd.DataFrame:
 
 
 def generar_pedidos(df: pd.DataFrame, skus_validos: set, cfg: SimConfig
-                    ) -> list[list[str]]:
+                    ) -> list[dict]:
     """Pedidos sintéticos: nº de líneas ~ Poisson(media), SKUs muestreados con
-    probabilidad proporcional al peso de su clase ABC."""
+    probabilidad proporcional al peso de su clase ABC, unidades por línea
+    ~ 1 + Poisson(media−1). Devuelve [{"id", "lineas": [(sku, cant), ...]}]."""
     rng = np.random.default_rng(cfg.seed)
     d = df[df["sku"].astype(str).isin(skus_validos)]
     if d.empty:
@@ -196,11 +211,98 @@ def generar_pedidos(df: pd.DataFrame, skus_validos: set, cfg: SimConfig
     p = w / w.sum()
     skus = d["sku"].astype(str).to_numpy()
     pedidos = []
-    for _ in range(int(cfg.n_pedidos)):
+    for i in range(int(cfg.n_pedidos)):
         n = 1 + int(rng.poisson(max(cfg.lineas_media - 1.0, 0.0)))
         n = min(n, len(skus))
-        pedidos.append(list(rng.choice(skus, size=n, replace=False, p=p)))
+        elegidos = rng.choice(skus, size=n, replace=False, p=p)
+        cants = 1 + rng.poisson(max(cfg.unidades_media - 1.0, 0.0), size=n)
+        pedidos.append({"id": i + 1,
+                        "lineas": [(str(s), float(c))
+                                   for s, c in zip(elegidos, cants)]})
     return pedidos
+
+
+# Sinónimos aceptados por columna del CSV de salidas (ya normalizados con
+# io._norm_key: minúsculas, sin acentos ni signos).
+_ALIAS_SALIDAS = {
+    "pedido": {"pedido", "no pedido", "num pedido", "numero pedido",
+               "id pedido", "pedido id", "orden", "no orden", "order",
+               "order id", "folio", "documento", "remision", "factura",
+               "embarque", "salida"},
+    "sku": {"sku", "articulo", "no articulo", "codigo", "codigo articulo",
+            "clave", "material", "item", "producto", "upc"},
+    "cantidad": {"cantidad", "cant", "unidades", "piezas", "pzas", "qty",
+                 "uds", "cajas"},
+    "fecha": {"fecha", "fecha pedido", "fecha salida", "fecha embarque",
+              "fecha surtido", "dia", "date"},
+}
+
+
+def adivinar_columnas_salidas(columnas) -> dict[str, str | None]:
+    """Sugiere qué columna del CSV corresponde a pedido/sku/cantidad/fecha."""
+    out: dict[str, str | None] = {campo: None for campo in _ALIAS_SALIDAS}
+    for col in columnas:
+        key = _norm_key(col)
+        for campo, alias in _ALIAS_SALIDAS.items():
+            if out[campo] is None and key in alias:
+                out[campo] = col
+    return out
+
+
+def pedidos_desde_csv(d: pd.DataFrame, col_pedido: str, col_sku: str,
+                      col_cantidad: str | None = None) -> list[dict]:
+    """Convierte un DataFrame de salidas (una fila = una línea de pedido) en
+    la lista de pedidos que consume `simular`. Líneas repetidas del mismo SKU
+    dentro de un pedido se suman; cantidades no numéricas cuentan como 1."""
+    cols = [c for c in (col_pedido, col_sku, col_cantidad) if c]
+    d = d[cols].copy()
+    d["_sku"] = d[col_sku].astype(str).str.strip()
+    if col_cantidad:
+        d["_cant"] = (pd.to_numeric(d[col_cantidad], errors="coerce")
+                      .fillna(1.0).clip(lower=0.0))
+        d = d[d["_cant"] > 0]
+    else:
+        d["_cant"] = 1.0
+    pedidos = []
+    for pid, g in d.groupby(col_pedido, sort=False):
+        lin = g.groupby("_sku", sort=False)["_cant"].sum()
+        pedidos.append({"id": str(pid),
+                        "lineas": [(s, float(c)) for s, c in lin.items()]})
+    return pedidos
+
+
+def _expandir_lineas(lineas: list[tuple], cap_u: float) -> list[tuple]:
+    """Divide líneas cuya cantidad excede la capacidad de un viaje: surtir 5
+    piezas con capacidad 2 implica 3 visitas a la misma ubicación."""
+    out = []
+    for sku, cant in lineas:
+        c = float(cant) if cant is not None and cant > 0 else 1.0
+        while cap_u and c > cap_u + 1e-9:
+            out.append((sku, float(cap_u)))
+            c -= cap_u
+        out.append((sku, c))
+    return out
+
+
+def _partir_viajes(orden: list[int], cants: list[float], cfg: SimConfig
+                   ) -> list[list[int]]:
+    """Corta la secuencia de picks (ya ruteada) en viajes que respetan la
+    capacidad por líneas y/o unidades. Sin límites → un solo viaje."""
+    grupos: list[list[int]] = []
+    cur: list[int] = []
+    u = 0.0
+    for k in orden:
+        c = cants[k]
+        llena = (cfg.cap_lineas_viaje and len(cur) >= cfg.cap_lineas_viaje) \
+            or (cfg.cap_unidades_viaje and u + c > cfg.cap_unidades_viaje + 1e-9)
+        if cur and llena:
+            grupos.append(cur)
+            cur, u = [], 0.0
+        cur.append(k)
+        u += c
+    if cur:
+        grupos.append(cur)
+    return grupos
 
 
 def _dist_manhattan(a: tuple, b: tuple) -> float:
@@ -222,12 +324,15 @@ def _ruta_nn(puntos: list[tuple], depot: tuple, dist_fn) -> tuple[list[int], flo
 
 
 def simular(df: pd.DataFrame, res: dict, cfg: SimConfig | None = None,
-            max_rutas: int = 60) -> dict:
-    """Corre la simulación. Devuelve pedidos, visitas por SKU, rutas y KPIs."""
+            max_rutas: int = 60, pedidos: list[dict] | None = None) -> dict:
+    """Corre la simulación. Si `pedidos` es None se genera demanda sintética;
+    pásale el resultado de `pedidos_desde_csv` para simular salidas reales.
+    Devuelve pedidos, visitas por SKU, rutas (por viaje) y KPIs."""
     cfg = cfg or SimConfig()
     pos = sku_positions(res)
     posmap = {r.sku: (r.x, r.y) for r in pos.itertuples()}
-    pedidos = generar_pedidos(df, set(posmap), cfg)
+    if pedidos is None:
+        pedidos = generar_pedidos(df, set(posmap), cfg)
     depot = (cfg.depot_x, cfg.depot_y)
 
     red = RedPasillos(res, cfg.celda_m) if cfg.modo_ruta == "pasillos" else None
@@ -235,47 +340,86 @@ def simular(df: pd.DataFrame, res: dict, cfg: SimConfig | None = None,
 
     filas, rutas = [], []
     visitas: dict[str, int] = {}
-    for i, ped in enumerate(pedidos):
-        pts = [posmap[s] for s in ped]
-        orden, dist = _ruta_nn(pts, depot, dist_fn)
-        t_s = dist / max(cfg.velocidad_mps, 0.05) \
-            + len(ped) * cfg.t_pick_s + cfg.t_fijo_s
-        filas.append({"pedido": i + 1, "lineas": len(ped),
-                      "dist_m": round(dist, 1), "t_min": round(t_s / 60, 2)})
-        for s in ped:
-            visitas[s] = visitas.get(s, 0) + 1
-        if i < max_rutas:
-            paradas = [depot] + [pts[k] for k in orden] + [depot]
-            if red is not None:
-                coords = []
-                for a, b in zip(paradas[:-1], paradas[1:]):
-                    tramo = red.camino(a, b)
-                    coords.extend(tramo if not coords else tramo[1:])
-            else:
-                coords = paradas
-            rutas.append({"pedido": i + 1, "coords": coords,
-                          "paradas": paradas[1:-1],
-                          "poly": red is not None})
+    lineas_descartadas = 0
+    pedidos_sin_pos = 0
+    for ped in pedidos:
+        pid = ped["id"]
+        lineas = [(s, float(c) if c and c > 0 else 1.0)
+                  for s, c in ped["lineas"] if s in posmap]
+        lineas_descartadas += len(ped["lineas"]) - len(lineas)
+        if not lineas:
+            pedidos_sin_pos += 1
+            continue
+        n_lin = len(lineas)
+        unidades = sum(c for _, c in lineas)
+        lineas = _expandir_lineas(lineas, cfg.cap_unidades_viaje)
+        pts = [posmap[s] for s, _ in lineas]
+        orden, _ = _ruta_nn(pts, depot, dist_fn)
+        grupos = _partir_viajes(orden, [c for _, c in lineas], cfg)
 
-    df_ped = pd.DataFrame(filas)
+        dist_ped = t_ped = 0.0
+        for nv, grupo in enumerate(grupos, start=1):
+            paradas = [depot] + [pts[k] for k in grupo] + [depot]
+            d_via = sum(dist_fn(a, b) for a, b in zip(paradas[:-1], paradas[1:]))
+            t_via = d_via / max(cfg.velocidad_mps, 0.05) + cfg.t_fijo_s + sum(
+                cfg.t_pick_s + cfg.t_pick_unidad_s * max(lineas[k][1] - 1, 0.0)
+                for k in grupo)
+            dist_ped += d_via
+            t_ped += t_via
+            if len(rutas) < max_rutas:
+                if red is not None:
+                    coords = []
+                    for a, b in zip(paradas[:-1], paradas[1:]):
+                        tramo = red.camino(a, b)
+                        coords.extend(tramo if not coords else tramo[1:])
+                else:
+                    coords = paradas
+                rutas.append({"pedido": pid, "viaje": nv,
+                              "n_viajes": len(grupos), "coords": coords,
+                              "paradas": paradas[1:-1],
+                              "dist_m": round(d_via, 1),
+                              "t_min": round(t_via / 60, 2),
+                              "poly": red is not None})
+        for s, _ in lineas:
+            visitas[s] = visitas.get(s, 0) + 1
+        filas.append({"pedido": pid, "lineas": n_lin,
+                      "unidades": round(unidades, 1), "viajes": len(grupos),
+                      "dist_m": round(dist_ped, 1),
+                      "t_min": round(t_ped / 60, 2)})
+
+    df_ped = pd.DataFrame(
+        filas, columns=["pedido", "lineas", "unidades", "viajes",
+                        "dist_m", "t_min"])
     df_vis = pos.copy()
     df_vis["visitas"] = df_vis["sku"].map(visitas).fillna(0).astype(int)
 
     total_lineas = int(df_ped["lineas"].sum()) if len(df_ped) else 0
+    total_unidades = float(df_ped["unidades"].sum()) if len(df_ped) else 0.0
+    total_viajes = int(df_ped["viajes"].sum()) if len(df_ped) else 0
     t_total_h = float(df_ped["t_min"].sum()) / 60 if len(df_ped) else 0.0
     dist_total = float(df_ped["dist_m"].sum()) if len(df_ped) else 0.0
     skus_sin_pos = int(df["sku"].astype(str).nunique() - len(posmap))
+    horas_disp = cfg.n_operadores * cfg.horas_turno
     kpis = {
         "pedidos": len(df_ped),
         "lineas_total": total_lineas,
+        "unidades_total": round(total_unidades, 1),
+        "viajes_total": total_viajes,
         "dist_total_km": round(dist_total / 1000, 2),
         "dist_media_pedido_m": round(dist_total / len(df_ped), 1) if len(df_ped) else 0,
         "t_total_h": round(t_total_h, 2),
         "t_medio_pedido_min": round(df_ped["t_min"].mean(), 2) if len(df_ped) else 0,
         "lineas_por_hora": round(total_lineas / t_total_h, 1) if t_total_h else 0,
+        "unidades_por_hora": round(total_unidades / t_total_h, 1) if t_total_h else 0,
         "pedidos_por_hora": round(len(df_ped) / t_total_h, 1) if t_total_h else 0,
         "skus_simulables": len(posmap),
         "skus_sin_posicion": skus_sin_pos,
+        "lineas_descartadas": lineas_descartadas,
+        "pedidos_sin_posicion": pedidos_sin_pos,
+        "horas_disponibles_turno": round(horas_disp, 1),
+        "utilizacion_turno_pct": round(100 * t_total_h / horas_disp, 1) if horas_disp else 0.0,
+        "operadores_necesarios": int(math.ceil(t_total_h / cfg.horas_turno))
+        if cfg.horas_turno and t_total_h else 0,
     }
     return {"pedidos": df_ped, "visitas": df_vis, "rutas": rutas,
             "kpis": kpis, "config": cfg}
