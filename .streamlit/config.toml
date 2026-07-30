@@ -1,0 +1,4 @@
+[client]
+# La aplicación ya presenta un menú secuencial con estado en slotting/ui.py.
+# Oculta la navegación automática generada a partir de pages/ para no duplicarla.
+showSidebarNavigation = false

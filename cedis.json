@@ -1,0 +1,22 @@
+[
+  {
+    "nombre": "Aguascalientes",
+    "codigo": "AGS",
+    "root": "datos/cedis/AGS",
+    "engine_profile": "default",
+    "archivos": {
+      "dcf": "../../compartidos/cat_dcfmuebles.csv",
+      "muebles": "../../compartidos/Catalogo_Muebles.csv",
+      "inventario": "Inventario_CEDIS_AguasCalientes.csv",
+      "zonas": "catalogo_zonas_surtidor.csv",
+      "estiba": "../../compartidos/reglas_estiba_clase.csv",
+      "estructuras": "catalogo_estructuras_zona.csv",
+      "surtido": "Aguascalientes.csv",
+      "politica": "politica_inventario_todas_secciones.csv",
+      "excepciones": "excepciones_asignacion_zona.csv",
+      "evaluacion_abc": "evaluacion_frecuencia_abc_por_seccion.csv",
+      "analisis_dcf": "analisis_dcf_concentrador.html",
+      "maestra_dcf": "maestra_dcf_grupo_operativo.csv"
+    }
+  }
+]

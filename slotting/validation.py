@@ -77,17 +77,17 @@ def _modified_zscore(values: np.ndarray) -> np.ndarray:
 
 def _group_median(df: pd.DataFrame, value_col: str, cfg: ValidationConfig
                   ) -> pd.Series:
-    """Mediana sugerida por SKU: del DCF si el grupo es suficiente, si no de la
-    familia, y como último recurso global. Calculada sobre valores > 0.
+    """Mediana sugerida por SKU a partir de pares del mismo DCF.
+
+    Si el DCF no tiene suficientes pares válidos, se deja NaN: el SKU queda
+    pendiente de revisión física en vez de imputar una medida de otra familia
+    o del catálogo completo.
     """
     valid = df[value_col].where(df[value_col] > 0)
 
-    by_dcf = valid.groupby(df["dcf"]).transform(
+    return valid.groupby(df["dcf"]).transform(
         lambda s: s.median() if s.notna().sum() >= cfg.min_group_size else np.nan
     )
-    by_fam = valid.groupby(df["familia"]).transform("median")
-    global_med = valid.median()
-    return by_dcf.fillna(by_fam).fillna(global_med)
 
 
 # --------------------------------------------------------------------------- #
@@ -228,8 +228,15 @@ def validate(df: pd.DataFrame, cfg: ValidationConfig | None = None
 
 
 def _aplicar_correcciones(df, df_issues, cfg) -> pd.DataFrame:
-    """Aplica los valores sugeridos según la config y marca columnas *_flag."""
+    """Aplica valores sugeridos y conserva trazabilidad de dimensiones estimadas.
+
+    Las dimensiones corregidas por pares comparables del DCF son utilizables
+    para una simulación provisional, pero nunca se confunden con una medida
+    física confirmada: ``dimension_estimada`` queda marcada en la salida.
+    """
     out = df.copy()
+    out["dimension_estimada"] = False
+    out["origen_dimension"] = "medida_fuente"
     if df_issues.empty:
         out["tiene_problema"] = False
         return out
@@ -255,6 +262,9 @@ def _aplicar_correcciones(df, df_issues, cfg) -> pd.DataFrame:
             # Por defecto solo auto-corregimos problemas "duros" (faltante, cero,
             # rango, densidad). Los OUTLIER se marcan pero se respeta el dato.
             out.at[idx, campo] = sug
+            if campo in DIMENSIONES:
+                out.at[idx, "dimension_estimada"] = True
+                out.at[idx, "origen_dimension"] = "mediana_dcf"
         flag_col = f"{campo}_flag"
         out[flag_col] = out.get(flag_col, "")
         prev = out.at[idx, flag_col]

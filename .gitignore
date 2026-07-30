@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Artefactos locales de ejecución
+slotting_scenarios.db
+datos/cedis/*/salidas_barrido/
+
+# Datos operativos o generados por CEDIS (pueden ser grandes o sensibles)
+datos/cedis/*/*.csv
+!datos/cedis/*/catalogo_estructuras_zona.csv
+!datos/cedis/*/catalogo_zonas_surtidor.csv
+!datos/cedis/*/areas_zona.csv

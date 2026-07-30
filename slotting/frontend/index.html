@@ -1,0 +1,48 @@
+<div id="slot-drag-editor"></div>
+<script>
+const root = document.getElementById("slot-drag-editor");
+let args = {}, slots = [], active = null;
+
+function send(type, value) {
+  window.parent.postMessage({isStreamlitMessage: true, type, value}, "*");
+}
+function ready() { send("streamlit:componentReady", {apiVersion: 1}); }
+function height() { send("streamlit:setFrameHeight", {height: document.body.scrollHeight}); }
+function snap(v) { const g = Number(args.rejilla || .25); return Math.round(v / g) * g; }
+function emit() { send("streamlit:setComponentValue", slots.map(s => ({...s}))); }
+function scalePoint(e, svg) {
+  const r = svg.getBoundingClientRect();
+  return {x: (e.clientX - r.left) * Number(args.ancho) / r.width,
+          y: (r.bottom - e.clientY) * Number(args.largo) / r.height};
+}
+function render() {
+  const w = Math.max(Number(args.ancho || 1), 1), h = Math.max(Number(args.largo || 1), 1);
+  root.innerHTML = "";
+  const note = document.createElement("div");
+  note.textContent = "Arrastra una ubicación y suéltala para proponer el movimiento.";
+  note.style.cssText = "font:13px sans-serif;color:#555;margin:0 0 6px";
+  root.appendChild(note);
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`); svg.setAttribute("width", "100%");
+  svg.setAttribute("height", Math.min(520, Math.max(260, h * 10)));
+  svg.style.cssText = "background:#f7f7f7;border:1px solid #bbb;touch-action:none";
+  const grid = Number(args.rejilla || .25);
+  for (let x=0; x<=w; x+=grid) { const l=document.createElementNS(svg.namespaceURI,"line"); l.setAttribute("x1",x);l.setAttribute("x2",x);l.setAttribute("y1",0);l.setAttribute("y2",h);l.setAttribute("stroke","#ddd");l.setAttribute("stroke-width",Math.min(.02,grid/20));svg.appendChild(l); }
+  for (let y=0; y<=h; y+=grid) { const l=document.createElementNS(svg.namespaceURI,"line"); l.setAttribute("x1",0);l.setAttribute("x2",w);l.setAttribute("y1",y);l.setAttribute("y2",y);l.setAttribute("stroke","#ddd");l.setAttribute("stroke-width",Math.min(.02,grid/20));svg.appendChild(l); }
+  slots.forEach((s, i) => {
+    const r = document.createElementNS(svg.namespaceURI, "rect");
+    r.setAttribute("x", s.x); r.setAttribute("y", h - s.y - s.d);
+    r.setAttribute("width", s.w); r.setAttribute("height", s.d);
+    r.setAttribute("fill", "#4c78a8"); r.setAttribute("fill-opacity", ".48");
+    r.setAttribute("stroke", "#174a7a"); r.setAttribute("stroke-width", ".05");
+    r.style.cursor = "grab"; r.setAttribute("aria-label", `Ubicación ${s.id}`);
+    r.addEventListener("pointerdown", e => { const p=scalePoint(e,svg); active={i, p, x:s.x, y:s.y}; r.setPointerCapture(e.pointerId); r.style.cursor="grabbing"; });
+    r.addEventListener("pointermove", e => { if (!active || active.i !== i) return; const p=scalePoint(e,svg); s.x=snap(active.x+p.x-active.p.x);s.y=snap(active.y+p.y-active.p.y);r.setAttribute("x",s.x);r.setAttribute("y",h-s.y-s.d); });
+    r.addEventListener("pointerup", e => { if (!active || active.i !== i) return; active=null;r.style.cursor="grab";emit(); });
+    svg.appendChild(r);
+  });
+  root.appendChild(svg); height();
+}
+window.addEventListener("message", e => { if (e.data.type === "streamlit:render") { args=e.data.args || {}; slots=(args.slots || []).map(s => ({...s})); render(); } });
+ready();
+</script>

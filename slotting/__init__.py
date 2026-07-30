@@ -7,4 +7,13 @@ Módulos:
 La interfaz (Streamlit) vive en app.py / pages/ y solo consume estas funciones.
 """
 
-__all__ = ["io", "validation"]
+__all__ = [
+    "contexto",
+    "engine",
+    "facilities",
+    "io",
+    "paths",
+    "piso",
+    "scenario_store",
+    "validation",
+]

@@ -7,9 +7,11 @@ import pandas as pd
 import streamlit as st
 
 from slotting import validation as V
+from slotting.ui import navegacion
 
 st.set_page_config(page_title="Validación de datos", page_icon="🧹",
                    layout="wide")
+navegacion("validacion")
 st.title("🧹 Validación y limpieza de datos")
 
 if "df" not in st.session_state:

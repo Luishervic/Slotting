@@ -1,0 +1,113 @@
+<style>
+html,body{margin:0;background:#070b12;color:#e5e7eb;color-scheme:dark;font-family:Inter,system-ui,sans-serif}
+button,input,select{background:#111827;color:#e5e7eb;border:1px solid #334155;border-radius:5px;padding:4px 7px}
+button:hover{border-color:#38bdf8}
+</style>
+<div id="cad"></div>
+<script>
+const root=document.getElementById('cad'), ns='http://www.w3.org/2000/svg';
+let A={},P=[],O=[],E=[],Z=[],U=[],mode='select',drag=null,selected=[],presetW=0,presetD=0,guides={x:null,y:null},polygonDraft=[],incomingFingerprint=null;
+
+function post(type,extra={}){window.parent.postMessage({isStreamlitMessage:true,type,...extra},'*');}
+function ready(){post('streamlit:componentReady',{apiVersion:1});}
+function emit(){post('streamlit:setComponentValue',{value:{perimetro:P,obstaculos:O,accesos:E,zonas:Z,ubicaciones:U},dataType:'json'});}
+function frame(){post('streamlit:setFrameHeight',{height:Math.max(420,document.body.scrollHeight)});}
+function snap(n){const g=Number(A.rejilla)||.25;return Math.round(n/g)*g;}
+function clamp(p){return {x:Math.max(0,Math.min(Number(A.ancho),p.x)),y:Math.max(0,Math.min(Number(A.largo),p.y))};}
+function pt(e,svg){const r=svg.getBoundingClientRect();return clamp({x:snap((e.clientX-r.left)*Number(A.ancho)/r.width),y:snap((r.bottom-e.clientY)*Number(A.largo)/r.height)});}
+function add(el,attrs={}){Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));return el;}
+function list(kind){return kind==='obstacle'?O:kind==='access'?E:kind==='zone'?Z:kind==='slot'?U:P;}
+function sid(kind,index,sub=null){return sub===null?`${kind}:${index}`:`${kind}:${index}:${sub}`;}
+function isSelected(kind,index,sub=null){return selected.includes(sid(kind,index,sub));}
+function getSelection(){return selected.map(s=>{const [kind,n,j]=s.split(':'),index=Number(n),sub=j===undefined?null:Number(j),item=kind==='zoneVertex'?Z[index]?.poligono?.[sub]:list(kind)[index];return {kind,index,sub,item};}).filter(x=>x.item);}
+function clearSelection(){selected=[];}
+function select(kind,index,additive,sub=null){const key=sid(kind,index,sub);if(additive)selected=selected.includes(key)?selected.filter(x=>x!==key):[...selected,key];else if(!selected.includes(key))selected=[key];}
+function colorFor(o){return o.tipo==='drop_mercancia'?'#0369a1':'#b91c1c';}
+// Imán: al mover o dibujar, alinea bordes con el lienzo, vértices del
+// perímetro y bordes de zonas, elementos y ubicaciones cercanos.
+function rectItems(){return [...O.map((v,i)=>({kind:'obstacle',index:i,item:v})),...E.map((v,i)=>({kind:'access',index:i,item:v})),...Z.map((v,i)=>({kind:'zone',index:i,item:v})),...U.map((v,i)=>({kind:'slot',index:i,item:v}))].filter(r=>Number.isFinite(Number(r.item.x))&&Number.isFinite(Number(r.item.y))&&Number.isFinite(Number(r.item.w))&&Number.isFinite(Number(r.item.d)));}
+function imantar(records,dx=0,dy=0){
+  const moving=new Set(records.map(r=>sid(r.kind,r.index))), tol=Math.min(.35,Math.max(.12,(Number(A.rejilla)||.25)*.9));
+  const xedges=[0,Number(A.ancho),...P.map(p=>Number(p.x))], yedges=[0,Number(A.largo),...P.map(p=>Number(p.y))];
+  rectItems().filter(r=>!moving.has(sid(r.kind,r.index))).forEach(r=>{xedges.push(Number(r.item.x),Number(r.item.x)+Number(r.item.w));yedges.push(Number(r.item.y),Number(r.item.y)+Number(r.item.d));});
+  let bestX=0,bestY=0,scoreX=Infinity,scoreY=Infinity,guideX=null,guideY=null;
+  records.forEach(r=>{const v=r.item||list(r.kind)[r.index],x=Number(r.x??v.x)+dx,y=Number(r.y??v.y)+dy,w=Number(v.w),d=Number(v.d);xedges.forEach(e=>[e-x,e-(x+w)].forEach(delta=>{if(Math.abs(delta)<=tol&&Math.abs(delta)<scoreX){scoreX=Math.abs(delta);bestX=delta;guideX=e;}}));yedges.forEach(e=>[e-y,e-(y+d)].forEach(delta=>{if(Math.abs(delta)<=tol&&Math.abs(delta)<scoreY){scoreY=Math.abs(delta);bestY=delta;guideY=e;}}));});
+  return {dx:snap(dx+bestX),dy:snap(dy+bestY),guideX,guideY};
+}
+function rectInSvg(svg,item,color,label,kind,index){
+  const active=isSelected(kind,index), q=add(document.createElementNS(ns,'rect'),{x:item.x,y:Number(A.largo)-item.y-item.d,width:item.w,height:item.d,fill:color,'fill-opacity':'.42',stroke:active?'#facc15':color,'stroke-width':active?'.16':'.08'});
+  q.style.cursor='move';
+  q.addEventListener('pointerdown',e=>{
+    if(mode==='erase'){list(kind).splice(index,1);clearSelection();render();e.stopPropagation();return;}
+    if(mode==='select'){
+      select(kind,index,e.shiftKey); const records=getSelection();
+      drag={kind:'move',start:pt(e,svg),records:records.map(r=>({kind:r.kind,index:r.index,x:Number(r.item.x),y:Number(r.item.y)}))};
+      q.setPointerCapture(e.pointerId);render();e.stopPropagation();
+    }
+  });svg.appendChild(q);
+  const t=add(document.createElementNS(ns,'text'),{x:Number(item.x)+Number(item.w)/2,y:Number(A.largo)-Number(item.y)-Number(item.d)/2,'text-anchor':'middle','font-size':'.55','pointer-events':'none',fill:'#e5e7eb'});t.textContent=label;svg.appendChild(t);
+}
+function polygonInSvg(svg,item,index){
+  const q=add(document.createElementNS(ns,'polygon'),{points:item.poligono.map(p=>`${p.x},${Number(A.largo)-p.y}`).join(' '),fill:'#7c3aed','fill-opacity':'.24',stroke:'#a78bfa','stroke-width':'.10'});
+  svg.appendChild(q);
+  item.poligono.forEach((p,j)=>{
+    const c=add(document.createElementNS(ns,'circle'),{cx:p.x,cy:Number(A.largo)-p.y,r:'.20',fill:isSelected('zoneVertex',index,j)?'#facc15':'#a78bfa'});
+    c.style.cursor='grab';
+    c.addEventListener('pointerdown',e=>{
+      if(mode==='erase'&&item.poligono.length>3){item.poligono.splice(j,1);clearSelection();render();e.stopPropagation();return;}
+      if(mode==='select'){select('zoneVertex',index,e.shiftKey,j);drag={kind:'zoneVertex',index,sub:j};c.setPointerCapture(e.pointerId);render();e.stopPropagation();}
+    });
+    svg.appendChild(c);
+  });
+}
+function preview(svg,start,end){
+  let x=Math.min(start.x,end.x),y=Math.min(start.y,end.y),w=Math.abs(end.x-start.x),d=Math.abs(end.y-start.y);
+  if(presetW>0&&presetD>0){x=start.x;y=start.y;w=presetW;d=presetD;}
+  let q=svg.querySelector('#cad-preview'),t=svg.querySelector('#cad-preview-label');
+  if(!q){q=add(document.createElementNS(ns,'rect'),{id:'cad-preview',fill:'#0f766e','fill-opacity':'.25',stroke:'#2dd4bf','stroke-width':'.10','stroke-dasharray':'.18 .12'});svg.appendChild(q);t=add(document.createElementNS(ns,'text'),{id:'cad-preview-label','text-anchor':'middle','font-size':'.65',fill:'#e5e7eb','pointer-events':'none'});svg.appendChild(t);}
+  q.setAttribute('x',x);q.setAttribute('y',Number(A.largo)-y-d);q.setAttribute('width',w);q.setAttribute('height',d);t.setAttribute('x',x+w/2);t.setAttribute('y',Number(A.largo)-y-d/2);t.textContent=`${w.toFixed(2)} × ${d.toFixed(2)} m`;
+  return {x,y,w,d};
+}
+function inspector(){
+  const records=getSelection(), box=document.createElement('div');
+  box.style.cssText='font:14px sans-serif;margin:0 0 8px;padding:8px;background:#0e1623;color:#e5e7eb;border:1px solid #253247;border-radius:6px';
+  if(!records.length){box.innerHTML='Selecciona un elemento. Usa <b>Shift + clic</b> para añadir o quitar elementos de la selección.';return box;}
+  if(records.length>1){
+    box.innerHTML=`<b>${records.length} elementos seleccionados</b> · mover grupo: X <input id="mx" type="number" step="${A.rejilla}" value="0" style="width:75px"> m, Y <input id="my" type="number" step="${A.rejilla}" value="0" style="width:75px"> m <button id="move-group" type="button">Mover</button> <button id="clear-selection" type="button">Quitar selección</button>`;
+    box.querySelector('#move-group').onclick=()=>{let dx=snap(Number(box.querySelector('#mx').value)||0),dy=snap(Number(box.querySelector('#my').value)||0);const ajuste=imantar(records.map(r=>({kind:r.kind,index:r.index,item:r.item,x:Number(r.item.x),y:Number(r.item.y)})),dx,dy);records.forEach(r=>{r.item.x=snap(Number(r.item.x)+ajuste.dx);r.item.y=snap(Number(r.item.y)+ajuste.dy);});render();};
+    box.querySelector('#clear-selection').onclick=()=>{clearSelection();render();};return box;
+  }
+  const r=records[0],v=r.item,isVertex=r.kind==='vertex'||r.kind==='zoneVertex';
+  box.innerHTML=`<b>Propiedades — ${isVertex?(r.kind==='zoneVertex'?'vértice de zona':'vértice del perímetro'):r.kind==='slot'?'ubicación':r.kind==='obstacle'?'obstáculo':r.kind==='zone'?'zona':r.kind==='access'?'acceso':'elemento'}</b>
+    ${isVertex?'':`Nombre <input id="pn" value="${String(v.nombre||'').replace(/"/g,'&quot;')}" style="width:120px"> `}
+    X <input id="px" type="number" step="${A.rejilla}" value="${Number(v.x).toFixed(2)}" style="width:75px"> m
+    Y <input id="py" type="number" step="${A.rejilla}" value="${Number(v.y).toFixed(2)}" style="width:75px"> m
+    ${isVertex?'':`Ancho <input id="pw" type="number" min="0.01" step="${A.rejilla}" value="${Number(v.w).toFixed(2)}" style="width:75px"> m Largo <input id="pd" type="number" min="0.01" step="${A.rejilla}" value="${Number(v.d).toFixed(2)}" style="width:75px"> m`}
+    ${r.kind==='slot'?`<br><span style="color:#334155">Reserva de mercancía:</span> Familia <input id="pf" value="${String(v.familia_reservada||'').replace(/"/g,'&quot;')}" placeholder="sin reserva" style="width:130px"> Clase comercial <input id="pcl" value="${String(v.clase_comercial_reservada||'').replace(/"/g,'&quot;')}" placeholder="sin reserva" style="width:130px"> ABC <select id="pc"><option value="">Cualquiera</option>${['A','B','C','D','E'].map(c=>`<option ${String(v.clase_abc_reservada||'').toUpperCase()===c?'selected':''}>${c}</option>`).join('')}</select>`:''}
+    <button id="apply-props" type="button">Aplicar medidas</button>`;
+  box.querySelector('#apply-props').onclick=()=>{v.x=snap(Number(box.querySelector('#px').value)||0);v.y=snap(Number(box.querySelector('#py').value)||0);if(!isVertex){v.nombre=box.querySelector('#pn').value.trim()||v.nombre;v.w=Math.max(.01,snap(Number(box.querySelector('#pw').value)||.01));v.d=Math.max(.01,snap(Number(box.querySelector('#pd').value)||.01));if(r.kind==='slot'){v.familia_reservada=box.querySelector('#pf').value.trim()||null;v.clase_comercial_reservada=box.querySelector('#pcl').value.trim()||null;v.clase_abc_reservada=box.querySelector('#pc').value||null;}const ajuste=imantar([{kind:r.kind,index:r.index,item:v,x:v.x,y:v.y}],0,0);v.x=snap(v.x+ajuste.dx);v.y=snap(v.y+ajuste.dy);}render();};
+  return box;
+}
+function render(){
+  root.innerHTML='';const bar=document.createElement('div');bar.style.cssText='font:14px sans-serif;margin-bottom:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap';
+  bar.innerHTML=`<label>Herramienta <select id="mode"><option value="select">Seleccionar / mover</option><option value="obstacle">Dibujar obstáculo</option><option value="drop">Dibujar drop de mercancía</option><option value="zone">Dibujar zona rectangular</option><option value="zonePolygon">Dibujar zona poligonal</option><option value="entry">Dibujar entrada</option><option value="exit">Dibujar salida</option><option value="erase">Borrar elemento / vértice</option></select></label>
+  <label>Medida directa: ancho <input id="draw-w" type="number" min="0" step="${A.rejilla}" value="${presetW||''}" style="width:62px"> m × largo <input id="draw-d" type="number" min="0" step="${A.rejilla}" value="${presetD||''}" style="width:62px"> m</label>
+  <button id="clear-size" type="button">Dibujar libre</button><button id="vertex" type="button">Añadir vértice</button><button id="reset" type="button">Restablecer rectángulo</button>${mode==='zonePolygon'?`<button id="finish-poly" type="button" ${polygonDraft.length>=3?'':'disabled'}>Cerrar zona</button><button id="cancel-poly" type="button">Cancelar zona</button>`:''}<button id="save" type="button">Guardar borrador CAD</button><span style="color:#0f766e">Imán de bordes activo</span>`;
+  root.appendChild(bar);bar.querySelector('#mode').value=mode;bar.querySelector('#mode').onchange=e=>{mode=e.target.value;polygonDraft=[];render();};
+  const updatePreset=()=>{presetW=Math.max(0,snap(Number(bar.querySelector('#draw-w').value)||0));presetD=Math.max(0,snap(Number(bar.querySelector('#draw-d').value)||0));};bar.querySelector('#draw-w').oninput=updatePreset;bar.querySelector('#draw-d').oninput=updatePreset;
+  bar.querySelector('#clear-size').onclick=()=>{presetW=0;presetD=0;render();};bar.querySelector('#vertex').onclick=()=>{if(P.length>=2){const a=P[0],b=P[1];P.splice(1,0,{x:snap((a.x+b.x)/2),y:snap((a.y+b.y)/2)});render();}};
+  bar.querySelector('#reset').onclick=()=>{P=[{x:0,y:0},{x:Number(A.ancho),y:0},{x:Number(A.ancho),y:Number(A.largo)},{x:0,y:Number(A.largo)}];clearSelection();render();};bar.querySelector('#finish-poly')?.addEventListener('click',finishPolygon);bar.querySelector('#cancel-poly')?.addEventListener('click',()=>{polygonDraft=[];mode='select';render();});bar.querySelector('#save').onclick=emit;root.appendChild(inspector());
+  const svg=add(document.createElementNS(ns,'svg'),{viewBox:`0 0 ${A.ancho} ${A.largo}`,width:'100%',height:Math.min(560,Math.max(320,Number(A.largo)*10))});svg.style.cssText='background:#080d15;border:1px solid #334155;touch-action:none;border-radius:6px';
+  const grid=Number(A.rejilla)||.25;for(let x=0;x<=Number(A.ancho)+1e-9;x+=grid)svg.appendChild(add(document.createElementNS(ns,'line'),{x1:x,x2:x,y1:0,y2:A.largo,stroke:'#1f2937','stroke-width':'.02'}));for(let y=0;y<=Number(A.largo)+1e-9;y+=grid)svg.appendChild(add(document.createElementNS(ns,'line'),{x1:0,x2:A.ancho,y1:y,y2:y,stroke:'#1f2937','stroke-width':'.02'}));if(Number.isFinite(guides.x))svg.appendChild(add(document.createElementNS(ns,'line'),{x1:guides.x,x2:guides.x,y1:0,y2:A.largo,stroke:'#f59e0b','stroke-width':'.10','stroke-dasharray':'.25 .15'}));if(Number.isFinite(guides.y))svg.appendChild(add(document.createElementNS(ns,'line'),{x1:0,x2:A.ancho,y1:Number(A.largo)-guides.y,y2:Number(A.largo)-guides.y,stroke:'#f59e0b','stroke-width':'.10','stroke-dasharray':'.25 .15'}));
+  svg.appendChild(add(document.createElementNS(ns,'polygon'),{points:P.map(p=>`${p.x},${Number(A.largo)-p.y}`).join(' '),fill:'#dbeafe','fill-opacity':'.38',stroke:'#1d4ed8','stroke-width':'.12'}));
+  P.forEach((p,index)=>{const c=add(document.createElementNS(ns,'circle'),{cx:p.x,cy:Number(A.largo)-p.y,r:'.22',fill:isSelected('vertex',index)?'#facc15':'#1d4ed8'});c.style.cursor='grab';c.addEventListener('pointerdown',e=>{if(mode==='erase'&&P.length>3){P.splice(index,1);clearSelection();render();e.stopPropagation();return;}if(mode==='select'){select('vertex',index,e.shiftKey);drag={kind:'vertex',index};c.setPointerCapture(e.pointerId);render();e.stopPropagation();}});svg.appendChild(c);});
+  O.forEach((item,index)=>rectInSvg(svg,item,colorFor(item),item.nombre||(item.tipo==='drop_mercancia'?'drop':'obstáculo'),'obstacle',index));Z.forEach((item,index)=>Array.isArray(item.poligono)&&item.poligono.length>=3?polygonInSvg(svg,item,index):rectInSvg(svg,item,'#7c3aed',item.nombre||'zona','zone',index));E.forEach((item,index)=>rectInSvg(svg,item,item.tipo==='salida'?'#ea580c':'#15803d',item.tipo||'entrada','access',index));U.forEach((item,index)=>{const reserva=[item.familia_reservada,item.clase_comercial_reservada,item.clase_abc_reservada].filter(Boolean).join(' / ');rectInSvg(svg,item,item.multisku?'#7e22ce':'#059669',`${item.id||`U${index+1}`}${reserva?` · ${reserva}`:''}`,'slot',index);});
+  if(polygonDraft.length){svg.appendChild(add(document.createElementNS(ns,'polyline'),{points:polygonDraft.map(p=>`${p.x},${Number(A.largo)-p.y}`).join(' '),fill:'none',stroke:'#f59e0b','stroke-width':'.12'}));polygonDraft.forEach(p=>svg.appendChild(add(document.createElementNS(ns,'circle'),{cx:p.x,cy:Number(A.largo)-p.y,r:'.16',fill:'#f59e0b'})));}
+  svg.addEventListener('pointerdown',e=>{if(mode==='select'){clearSelection();render();return;}if(mode==='zonePolygon'){polygonDraft.push(pt(e,svg));render();return;}if(['obstacle','drop','zone','entry','exit'].includes(mode)&&!drag){const start=pt(e,svg);if(presetW>0&&presetD>0){addDrawn(start.x,start.y,presetW,presetD);render();}else{drag={kind:'draw',start};svg.setPointerCapture(e.pointerId);preview(svg,start,start);}}});svg.addEventListener('dblclick',e=>{if(mode==='zonePolygon'&&polygonDraft.length>=3){e.preventDefault();finishPolygon();}});root.appendChild(svg);frame();
+}
+function addDrawn(x,y,w,d){let target,kind,item;if(mode==='obstacle'){target=O;kind='obstacle';item={nombre:`obstáculo ${O.length+1}`,x,y,w,d,tipo:'zona_bloqueada'};}else if(mode==='drop'){target=O;kind='obstacle';item={nombre:`Drop ${O.filter(o=>o.tipo==='drop_mercancia').length+1}`,x,y,w,d,tipo:'drop_mercancia'};}else if(mode==='zone'){target=Z;kind='zone';item={nombre:`Zona ${Z.length+1}`,x,y,w,d,prioridad:Z.length+1};}else{target=E;kind='access';item={nombre:`${mode==='exit'?'salida':'entrada'} ${E.length+1}`,tipo:mode==='exit'?'salida':'entrada',x,y,w,d};}target.push(item);const ajuste=imantar([{kind,index:target.length-1,item,x,y}],0,0);item.x=snap(item.x+ajuste.dx);item.y=snap(item.y+ajuste.dy);}
+function finishPolygon(){if(polygonDraft.length<3)return;Z.push({nombre:`Zona ${Z.length+1}`,prioridad:Z.length+1,poligono:polygonDraft.map(p=>({...p}))});polygonDraft=[];mode='select';render();}
+document.addEventListener('pointermove',e=>{if(!drag)return;const svg=root.querySelector('svg');if(!svg)return;const p=pt(e,svg);if(drag.kind==='draw'){preview(svg,drag.start,p);return;}if(drag.kind==='vertex'){P[drag.index]=p;}else if(drag.kind==='zoneVertex'){Z[drag.index].poligono[drag.sub]=p;}else if(drag.kind==='move'){let dx=snap(p.x-drag.start.x),dy=snap(p.y-drag.start.y);const ajuste=imantar(drag.records,dx,dy);guides={x:ajuste.guideX,y:ajuste.guideY};drag.records.forEach(r=>{const v=list(r.kind)[r.index];if(v){v.x=snap(r.x+ajuste.dx);v.y=snap(r.y+ajuste.dy);}});}render();});
+document.addEventListener('pointerup',e=>{if(!drag)return;const svg=root.querySelector('svg');if(!svg){drag=null;return;}if(drag.kind==='draw'){const p=pt(e,svg),x=Math.min(drag.start.x,p.x),y=Math.min(drag.start.y,p.y),w=Math.abs(p.x-drag.start.x),d=Math.abs(p.y-drag.start.y);if(w>.01&&d>.01)addDrawn(x,y,w,d);}drag=null;guides={x:null,y:null};render();});
+window.addEventListener('message',e=>{if(e.data.type!=='streamlit:render')return;const next=e.data.args||{},fingerprint=JSON.stringify({ancho:next.ancho,largo:next.largo,rejilla:next.rejilla,perimetro:next.perimetro||[],obstaculos:next.obstaculos||[],accesos:next.accesos||[],zonas:next.zonas||[],ubicaciones:next.ubicaciones||[]});A=next;if(incomingFingerprint===fingerprint){frame();return;}incomingFingerprint=fingerprint;P=(A.perimetro||[]).map(p=>({x:Number(p.x??p[0]),y:Number(p.y??p[1])})).filter(p=>Number.isFinite(p.x)&&Number.isFinite(p.y));if(!P.length)P=[{x:0,y:0},{x:Number(A.ancho),y:0},{x:Number(A.ancho),y:Number(A.largo)},{x:0,y:Number(A.largo)}];O=(A.obstaculos||[]).map(x=>({...x}));E=(A.accesos||[]).map(x=>({...x}));Z=(A.zonas||[]).map(x=>({...x,poligono:Array.isArray(x.poligono)?x.poligono.map(p=>({...p})):x.poligono}));U=(A.ubicaciones||[]).map(x=>({...x}));clearSelection();render();});ready();
+</script>
