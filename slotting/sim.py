@@ -40,6 +40,7 @@ import pandas as pd
 
 from slotting.io import _norm_key
 from slotting.geometry import normalizar_poligono, punto_en_poligono
+from slotting import entrega as EN
 from slotting import rutas as RT
 
 
@@ -70,6 +71,15 @@ class SimConfig:
     horas_turno: float = 8.0         # duración del turno (h)
     depot_x: float = 0.0             # posición del andén / punto de salida
     depot_y: float = 0.0
+    # Cómo se declara el andén (ver `slotting.entrega`). Un andén corrido no es
+    # un punto: cada recorrido entrega en el tramo que le queda enfrente, y
+    # forzar la convergencia a una sola coordenada infla la distancia de los
+    # pasillos lejanos. "punto" conserva el comportamiento histórico.
+    entrega_modo: str = "punto"      # punto | lado | accesos
+    entrega_lado: str = "frente"     # frente | fondo | izquierda | derecha
+    entrega_desde: float | None = None   # recorte del andén sobre ese lado
+    entrega_hasta: float | None = None
+    entrega_retiro_m: float = 0.5    # separación del muro hacia el interior
     seed: int = 42
     modo_ruta: str = "pasillos"      # pasillos (esquiva estantes) | manhattan
     celda_m: float = 0.5             # resolución de la malla de pasillos
@@ -445,6 +455,67 @@ def _dist_manhattan(a: tuple, b: tuple) -> float:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
+# --------------------------------------------------------------------------- #
+# Modelo de tiempos y de trazo
+# --------------------------------------------------------------------------- #
+# Estos tres helpers son la ÚNICA definición de cuánto cuesta un recorrido y de
+# por dónde pasa. `simular` los usa para el surtido discreto y `slotting.metodos`
+# para los métodos con varios operadores. Vivir en un solo lugar es lo que
+# impide que la comparativa entre métodos mida con dos reglas distintas.
+def costear_paradas(paradas: list[dict], indices, cfg: SimConfig,
+                    nivelmap: dict, nskumap: dict) -> dict:
+    """Tiempo de pick, búsqueda y acceso vertical de un conjunto de paradas.
+
+    No incluye desplazamiento ni tiempo fijo de viaje: sólo lo que se paga al
+    estar parado frente a la ubicación. Posicionarse se cobra una vez por
+    PARADA; identificar, tomar y verificar se cobran por LÍNEA.
+    """
+    t_vertical = t_pick = t_busq = 0.0
+    picks_equipo = 0
+    for k in indices:
+        parada = paradas[k]
+        t_pick += cfg.t_posicionarse_s
+        nivel = _nivel_de_parada(parada, nivelmap)
+        t_vertical += max(0, nivel - 1) * cfg.t_extra_nivel_s
+        if _requiere_equipo(nivel, cfg):
+            t_vertical += cfg.t_equipo_s
+            picks_equipo += 1
+        for sku, cant in parada["lineas"]:
+            n_sk = max(1, int(nskumap.get(sku, 1)))
+            t_busq += cfg.t_identificar_k_s * math.log2(n_sk)
+            t_pick += (cfg.t_pick_s
+                       + cfg.t_pick_unidad_s * max(cant - 1, 0.0))
+    return {"t_pick_s": t_pick, "t_busqueda_s": t_busq,
+            "t_vertical_s": t_vertical, "picks_con_equipo": picks_equipo}
+
+
+def secuencia_tramo(pasos: list, i0: int, i1: int,
+                    origen: tuple, destino: tuple) -> list[tuple]:
+    """Puntos que recorre un viaje, de `origen` a `destino`.
+
+    Extiende el rango a los puntos de paso que la política colocó antes del
+    primer pick y después del último: son los que obligan a entrar y salir del
+    pasillo por donde la política manda. `origen`/`destino` son el depot en el
+    surtido discreto y el punto de traspaso de la zona en pick-and-pass.
+    """
+    while i0 > 0 and pasos[i0 - 1].pick is None:
+        i0 -= 1
+    while i1 < len(pasos) - 1 and pasos[i1 + 1].pick is None:
+        i1 += 1
+    return [origen] + [p.punto for p in pasos[i0:i1 + 1]] + [destino]
+
+
+def polilinea(secuencia: list[tuple], red: "RedPasillos | None") -> list[tuple]:
+    """Trazo real de la secuencia: por los pasillos si hay malla, recto si no."""
+    if red is None:
+        return list(secuencia)
+    coords: list[tuple] = []
+    for a, b in zip(secuencia[:-1], secuencia[1:]):
+        tramo = red.camino(a, b)
+        coords.extend(tramo if not coords else tramo[1:])
+    return coords
+
+
 def simular(df: pd.DataFrame, res: dict, cfg: SimConfig | None = None,
             max_rutas: int = 60, pedidos: list[dict] | None = None,
             red: "RedPasillos | None" = None,
@@ -473,7 +544,11 @@ def simular(df: pd.DataFrame, res: dict, cfg: SimConfig | None = None,
                for r in pos.itertuples()}
     if pedidos is None:
         pedidos = generar_pedidos(df, set(posmap), cfg)
-    depot = (cfg.depot_x, cfg.depot_y)
+    cfg_aco = res["config"]
+    frente = EN.desde_config(cfg, float(getattr(cfg_aco, "ancho_m", 0) or 0),
+                             float(getattr(cfg_aco, "largo_m", 0) or 0),
+                             res.get("accesos"))
+    depot = frente.punto_medio()
 
     if cfg.modo_ruta != "pasillos":
         red = None
@@ -510,7 +585,10 @@ def simular(df: pd.DataFrame, res: dict, cfg: SimConfig | None = None,
         paradas = _agrupar_en_paradas(lineas, posmap, ubicmap,
                                       cfg.cap_unidades_viaje)
         pts = [p["punto"] for p in paradas]
-        pasos = RT.secuenciar(politica_efectiva, pts, depot, topo, dist_fn)
+        # La política se orienta desde el punto de entrega que le corresponde a
+        # este pedido, no desde el centro del andén.
+        origen_pol = frente.para(pts[0]) if pts else depot
+        pasos = RT.secuenciar(politica_efectiva, pts, origen_pol, topo, dist_fn)
         orden = [p.pick for p in pasos if p.pick is not None]
         grupos = _partir_viajes(orden, paradas, cfg)
         idx_paso = {p.pick: i for i, p in enumerate(pasos)
@@ -522,31 +600,22 @@ def simular(df: pd.DataFrame, res: dict, cfg: SimConfig | None = None,
             # El tramo del viaje incluye los puntos de paso que la política
             # colocó antes del primer pick y después del último: son los que
             # obligan a entrar y salir del pasillo por donde marca la política.
-            i0, i1 = idx_paso[grupo[0]], idx_paso[grupo[-1]]
-            while i0 > 0 and pasos[i0 - 1].pick is None:
-                i0 -= 1
-            while i1 < len(pasos) - 1 and pasos[i1 + 1].pick is None:
-                i1 += 1
-            secuencia = [depot] + [p.punto for p in pasos[i0:i1 + 1]] + [depot]
+            # Cada viaje sale y entrega en SU punto del andén: el del primer
+            # pick y el del último. Con un andén corrido eso es lo que hace el
+            # surtidor, y obligarlo a converger en una coordenada única regala
+            # metros a los pasillos lejanos.
+            salida = frente.para(paradas[grupo[0]]["punto"])
+            llegada = frente.para(paradas[grupo[-1]]["punto"])
+            secuencia = secuencia_tramo(pasos, idx_paso[grupo[0]],
+                                        idx_paso[grupo[-1]], salida, llegada)
             d_via = sum(dist_fn(a, b)
                         for a, b in zip(secuencia[:-1], secuencia[1:]))
 
-            t_vertical = t_pick = t_busq = 0.0
-            picks_equipo = 0
-            for k in grupo:
-                parada = paradas[k]
-                # Posicionarse se paga una vez por parada, no por línea.
-                t_pick += cfg.t_posicionarse_s
-                nivel = _nivel_de_parada(parada, nivelmap)
-                t_vertical += max(0, nivel - 1) * cfg.t_extra_nivel_s
-                if _requiere_equipo(nivel, cfg):
-                    t_vertical += cfg.t_equipo_s
-                    picks_equipo += 1
-                for sku, cant in parada["lineas"]:
-                    n_sk = max(1, int(nskumap.get(sku, 1)))
-                    t_busq += cfg.t_identificar_k_s * math.log2(n_sk)
-                    t_pick += (cfg.t_pick_s
-                               + cfg.t_pick_unidad_s * max(cant - 1, 0.0))
+            costo = costear_paradas(paradas, grupo, cfg, nivelmap, nskumap)
+            t_pick = costo["t_pick_s"]
+            t_busq = costo["t_busqueda_s"]
+            t_vertical = costo["t_vertical_s"]
+            picks_equipo = costo["picks_con_equipo"]
             t_via = (d_via / max(cfg.velocidad_mps, 0.05) + cfg.t_fijo_s
                      + t_pick + t_busq + t_vertical)
             dist_ped += d_via
@@ -555,13 +624,7 @@ def simular(df: pd.DataFrame, res: dict, cfg: SimConfig | None = None,
             t_busq_ped += t_busq
             picks_equipo_ped += picks_equipo
             if len(rutas) < max_rutas:
-                if red is not None:
-                    coords = []
-                    for a, b in zip(secuencia[:-1], secuencia[1:]):
-                        tramo = red.camino(a, b)
-                        coords.extend(tramo if not coords else tramo[1:])
-                else:
-                    coords = secuencia
+                coords = polilinea(secuencia, red)
                 # Detalle por parada: qué se tomó, a qué nivel y si hizo falta
                 # equipo. Sólo se arma cuando la ruta se va a conservar, así
                 # que los barridos (`max_rutas=0`) no pagan nada por él. Es lo
@@ -676,7 +739,10 @@ def simular(df: pd.DataFrame, res: dict, cfg: SimConfig | None = None,
         "politica_sustituida": politica_efectiva != politica,
         "topologia_confiable": topo.confiable,
         "pasillos_detectados": len(topo.pasillos),
+        "entrega_modo": frente.modo,
+        "entrega_tramos": len(frente.tramos),
     }
     return {"pedidos": df_ped, "visitas": df_vis, "rutas": rutas,
             "kpis": kpis, "config": cfg, "topologia": topo,
+            "frente": frente,
             "avisos_ruteo": list(topo.avisos)}

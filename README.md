@@ -67,7 +67,9 @@ Flujo de usuario:
 3. **Diseñar layout:** configurar estructura y área, generar alternativas,
    confirmar el acomodo y guardar una versión.
 4. **Simular operación:** evaluar recorridos, productividad, niveles y equipos.
-5. **Escenarios:** consultar versiones inmutables, comparar KPIs y descargar
+5. **Métodos de surtido:** comparar cómo organizar el trabajo sobre ese mismo
+   layout —discreto, lotes, cluster, zonas, oleadas— y animar los mejores.
+6. **Escenarios:** consultar versiones inmutables, comparar KPIs y descargar
    sus artefactos.
 
 Las escrituras de maestros, reemplazos de layout, confirmación de alcance y
@@ -75,6 +77,119 @@ guardado de escenarios muestran un diálogo con el impacto antes de ejecutarse.
 
 **Calidad de datos** (`pages/1_Validacion_de_datos.py`) es una herramienta
 auxiliar para revisar valores atípicos, dimensiones y peso antes del diseño.
+
+## Importar el plano de la nave
+
+Si el plano de arquitectura ya existe, volver a dibujarlo a mano es trabajo
+duplicado y una fuente de error: el perímetro real tiene quiebres, las columnas
+están donde están y el andén no se puede mover. **Diseñar layout → Importar
+plano CAD** lo lee y lo traduce al editor.
+
+- **DXF** se lee directo con `ezdxf`. Es lo que conviene pedirle a quien mande
+  el plano.
+- **DWG** es binario y propietario: se convierte con el **ODA File Converter**,
+  un ejecutable gratuito de la Open Design Alliance
+  (`opendesign.com/guestfiles/oda_file_converter`). `slotting/cad_import.py`
+  lo detecta solo aunque la carpeta lleve el número de versión en el nombre.
+  Sin él la herramienta lo dice con todas sus letras: exportar DXF desde
+  AutoCAD es un «Guardar como».
+
+La importación es **por capas** — ahí vive la intención del dibujante. Se
+propone un rol por el nombre de la capa (muro → perímetro, columna → obstáculo,
+andén → acceso) y el usuario confirma en una tabla, con vista previa del
+resultado antes de tocar nada.
+
+Dos trampas que hunden una importación y que el módulo resuelve explícitamente:
+
+- **Unidades.** Casi todos los planos de nave vienen en milímetros; leídos como
+  metros dan una nave de 60 km y todo falla después, lejos de la causa. Se lee
+  `$INSUNITS` y, si el plano no lo declara, se infiere del tamaño y se avisa.
+- **Qué mide la nave.** Las dimensiones salen del PERÍMETRO, no de la extensión
+  del dibujo: cotas, viñeta y norte viven fuera del edificio y lo agrandarían
+  sin que nada lo delatara.
+
+## Dónde empieza y termina el recorrido
+
+Un andén no es un punto: es un lado. `slotting/entrega.py` modela el frente de
+entrega de tres formas —un punto, un lado completo (con opción de recortarlo a
+un tramo) o las puertas dibujadas en el CAD— y cada recorrido entrega en el
+punto que le queda enfrente, no en una coordenada común. Forzar la convergencia
+a un solo lugar infla la distancia de los pasillos lejanos: en una nave de
+90 × 70 m la diferencia medida fue de **247 a 202 m por pedido, un 18 %**.
+
+El modo `punto` sigue siendo el default y reproduce exactamente los resultados
+anteriores.
+
+## Interferencia entre operadores
+
+Un modelo que ignora la congestión miente a favor de los métodos que meten más
+gente en el mismo espacio. `slotting/interferencia.py` discretiza los pasillos
+de picking en tramos y lleva un registro de ocupación: si dos surtidores
+coinciden en el mismo tramo a la misma hora, el segundo pierde
+`traslape × factor_interferencia`.
+
+- El **factor** (0 = se rebasan sin problema, 1 = bloqueo total) es el único
+  parámetro y **no sale de los datos**: hay que calibrarlo observando piso. Se
+  expone como control visible, con 0.35 por defecto.
+- Sólo cuentan los **pasillos de picking**. Los transversales y el andén son
+  anchos y ahí la gente se cruza sin estorbarse.
+- Las **detenciones pesan más que el tránsito**: quien está surtiendo tapa el
+  pasillo el tiempo completo del pick. Como la coordenada de un pick es el
+  centro del módulo, se proyecta al pasillo de enfrente — sin eso, el bloqueo
+  dominante no se contaba y la interferencia salía en cero.
+
+El resultado esperado se confirma en las corridas: **el surtido por lotes y el
+cluster son los que más se estorban**, justo porque concentran operadores en
+menos pasillos. La pestaña **🚧 Interferencia** muestra el mapa de congestión
+por tramo, el reparto de uso del andén, y a partir de cuántos operadores la nave
+deja de absorber gente.
+
+## Métodos de surtido
+
+Un método de surtido no cambia el recorrido de un pedido: cambia cómo se
+reparte el trabajo entre pedidos y entre personas. Por eso `slotting/metodos.py`
+no suma tiempos en serie sino que corre un **motor de eventos discretos** con
+varios operadores a la vez, y mide el throughput del SISTEMA (makespan) y no la
+velocidad de una persona. Medido en serie, el surtido por zonas da exactamente
+el mismo número que el discreto y la comparación sale en empate.
+
+| Método | Qué compra | Qué paga |
+| --- | --- | --- |
+| Discreto | Trazabilidad y cero coordinación | El viaje completo por cada pedido |
+| Por lotes (batch) | Amortiza el viaje entre varios pedidos | Clasificar el lote al regresar; el ciclo del pedido se alarga |
+| Cluster / carro | Igual que el lote sin estación de clasificación | Cada pick es más lento; el carro topa en posiciones |
+| Zonas secuencial | Nadie cruza la nave de punta a punta | El pedido espera en cola en cada zona; traspasos |
+| Zonas paralelo | Ciclo corto por paralelismo | Consolidación, sincronía y sensibilidad al desbalance |
+| Oleadas | Corte alineado al embarque | El bloque va al ritmo de su pedido más lento |
+
+Se cruzan con dos ejes más: el **corte de zonas**
+(`slotting/zonificacion.py`: por pasillo o por bloque, uniforme o balanceado
+por carga real) y la **política de recorrido** (`slotting/rutas.py`).
+
+Tres cosas que conviene saber al leer los resultados:
+
+- **El ganador depende del tamaño de la cuadrilla.** Con poca gente zonificar
+  sólo agrega traspasos; con suficiente, es lo único que evita que se estorben.
+  Por eso la salida principal es una curva productividad vs. operadores y no un
+  número, y `punto_de_cruce` dice a partir de cuántos operadores cambia la
+  decisión.
+- **En un esquema por zonas manda la zona más cargada,** no el promedio. El
+  corte uniforme sobre una nave con ABC al frente concentra el trabajo en las
+  primeras zonas; el índice de equilibrio y el desbalance entre operadores lo
+  delatan antes que cualquier otro indicador.
+- **La capacidad del equipo puede prohibir un método.** Con electrodomésticos,
+  `cap_unidades_viaje` decide si el surtido por lotes es siquiera posible; la
+  conclusión honesta suele ser distinta por zona física.
+
+Fuera del modelo, y por eso declarado en la interfaz: la interferencia entre
+operadores en un mismo pasillo y el costo de supervisión. La columna de
+simplicidad operativa es juicio, no dato.
+
+La animación (`slotting/animacion.py`) reproduce hasta tres métodos en paneles
+que **comparten un solo reloj**: es el mismo instante simulado en los tres, así
+que cuando un panel ya vació su tablero y otro sigue caminando, la diferencia se
+ve sin leer ninguna tabla. La línea de tiempo la produce el motor de eventos; el
+navegador sólo interpola posiciones.
 
 ## Comparación de escenarios
 
@@ -278,7 +393,8 @@ datos/cedis/<CODIGO>/        Entradas, maestros y salidas de cada CEDIS
 pages/1_Datos.py             Datos, validación y selección del alcance
 pages/2_Diseno.py            CAD, alternativas y resultado 2D/3D
 pages/3_Operacion.py         Simulación operativa
-pages/4_Escenarios.py        Versiones, comparación y descargas
+pages/4_Comparativa.py       Métodos de surtido, comparativa y animación
+pages/5_Escenarios.py        Versiones, comparación y descargas
 pages/1_Validacion_de_datos.py Calidad de datos auxiliar
 slotting/io.py               Normalización, catálogos y trazabilidad
 slotting/facilities.py       Registro y archivos independientes por CEDIS
@@ -295,7 +411,15 @@ slotting/engine/optimization.py Alternativas y ranking
 slotting/engine/registry.py  Perfiles sustituibles por CEDIS
 slotting/profiles/           Variantes aisladas de cálculo por CEDIS
 slotting/slots.py            Fachada de compatibilidad heredada
-slotting/sim.py              Pedidos y recorridos
+slotting/sim.py              Pedidos, recorridos y modelo de tiempos
+slotting/cad_import.py       Importación de planos DWG y DXF por capas
+slotting/entrega.py          Frente de andén: dónde empieza y termina un viaje
+slotting/interferencia.py    Congestión entre operadores en los pasillos
+slotting/metodos.py          Métodos de surtido y motor de eventos discretos
+slotting/zonificacion.py     Cortes de zona por pasillo, bloque y carga
+slotting/comparador_metodos.py Barrido de métodos, score y explicación
+slotting/animacion.py        Línea de tiempo comparada de varios métodos
+slotting/anim_frontend/      Animación 2D sincronizada
 slotting/demanda.py          Recorridos reales, ABC por ventana y granularidad
 slotting/rutas.py            Políticas de recorrido y topología de pasillos
 slotting/acomodo.py          Granularidad de ubicación y estrategias ABC

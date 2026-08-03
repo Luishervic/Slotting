@@ -16,7 +16,7 @@ st.set_page_config(
 )
 navegacion("escenarios")
 titulo_pagina(
-    "Paso 4 de 4",
+    "Paso 5 de 5",
     "Escenarios",
     "Consulta versiones inmutables y compara sus resultados.",
 )

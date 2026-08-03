@@ -10,6 +10,9 @@ se agrega una entrada a `cedis.json` y una carpeta bajo
 - `app.py` y `pages/`: interfaz Streamlit y flujo de usuario.
 - `slotting/`: dominio, simulación, optimización, persistencia y adaptadores.
 - `slotting/engine/`: motor común; no contiene rutas ni nombres de CEDIS.
+- `slotting/metodos.py`: organización del trabajo y motor de eventos
+  discretos. Depende de `sim` para medir tiempos y de `zonificacion` para
+  repartir el espacio; nunca al revés.
 - `slotting/profiles/`: variantes algorítmicas seleccionadas por
   `engine_profile`.
 - `slotting/piso/`: reglas exclusivas del dominio PISO.
@@ -27,6 +30,21 @@ que sea absoluta.
 La interfaz y los procesos por lotes reciben un `FacilityConfig`; no deben
 construir nombres de archivos de Aguascalientes ni recorrer carpetas externas
 al centro seleccionado.
+
+## Una sola regla para medir el tiempo
+
+`sim.costear_paradas`, `sim.secuencia_tramo` y `sim.polilinea` son la ÚNICA
+definición de cuánto cuesta un recorrido y por dónde pasa. Las usan tanto
+`sim.simular` (surtido discreto de un operador) como `slotting.metodos` (varios
+operadores en paralelo).
+
+Esto no es una preferencia de estilo: una comparativa entre métodos de surtido
+sólo significa algo si todos se miden con la misma regla. Si el modelo de
+tiempos se duplicara, cualquier divergencia entre las copias aparecería como una
+diferencia entre métodos, y sería indistinguible de un hallazgo real.
+
+Al agregar un método nuevo, la diferencia debe estar en cómo genera y ordena sus
+tareas —`metodos.generar_tareas`—, nunca en cómo cobra el tiempo.
 
 ## Trabajo en paralelo
 

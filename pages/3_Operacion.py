@@ -481,6 +481,6 @@ with st.expander("Guardar resultado operativo", expanded=False):
             ),
             al_confirmar=_save_operation_scenario,
             etiqueta_confirmar="Guardar",
-            destino="pages/4_Escenarios.py",
+            destino="pages/5_Escenarios.py",
             clave="guardar_operacion",
         )

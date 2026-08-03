@@ -16,6 +16,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from slotting.engine.registry import get_profile
+from slotting import cad_import as CAD
 from slotting import viz
 from slotting.cad_editor import editor as editor_cad
 from slotting.drag_editor import editor as editor_arrastre
@@ -431,6 +432,137 @@ st.session_state["meta_escenario"] = {
 st.subheader("1. Plano operativo")
 st.caption("Captura dimensiones, modifica el contorno con vértices y dibuja zonas, "
            "obstáculos, entradas o salidas. Guarda el borrador CAD y después aplícalo.")
+
+# --------------------------------------------------------------------------- #
+# Importar el plano de arquitectura
+# --------------------------------------------------------------------------- #
+_soporte_cad = CAD.soporte()
+with st.expander("📐 Importar plano CAD (DWG o DXF)", expanded=False):
+    st.caption(
+        "Si ya existe el plano de la nave, no hay por qué volver a dibujarla: "
+        "el perímetro real tiene quiebres, las columnas están donde están y el "
+        "andén no se puede mover. Se importa por CAPAS, que es donde vive la "
+        "intención del dibujante."
+        + ("" if _soporte_cad["dwg"] else "  \n\n⚠️ " + _soporte_cad["detalle"]))
+    if _soporte_cad["oda"]:
+        st.caption(f"Convertidor DWG detectado: `{_soporte_cad['oda']}`")
+
+    plano_subido = st.file_uploader(
+        "Plano de la nave", type=["dxf", "dwg"], key="upl_cad",
+        help="DXF se lee directo. DWG se convierte con el ODA File Converter.")
+
+    ci1, ci2 = st.columns([1, 1])
+    escala_opt = ci1.selectbox(
+        "Unidades del plano",
+        ["auto", "milímetros", "centímetros", "metros", "pulgadas", "pies"],
+        help="«auto» lee las unidades declaradas en el archivo y, si no las "
+             "trae, las infiere del tamaño. Casi todos los planos de nave "
+             "vienen en milímetros.")
+    _ESCALAS = {"milímetros": 0.001, "centímetros": 0.01, "metros": 1.0,
+                "pulgadas": 0.0254, "pies": 0.3048}
+
+    if plano_subido is not None:
+        firma_plano = f"{plano_subido.name}:{plano_subido.size}:{escala_opt}"
+        if st.session_state.get("cad_plano_firma") != firma_plano:
+            try:
+                with st.spinner("Leyendo el plano…"):
+                    st.session_state["cad_plano"] = CAD.leer(
+                        plano_subido.getvalue(), plano_subido.name,
+                        _ESCALAS.get(escala_opt))
+                st.session_state["cad_plano_firma"] = firma_plano
+                st.session_state["cad_plano_roles"] = None
+            except CAD.ErrorPlano as exc:
+                st.error(str(exc))
+                st.session_state.pop("cad_plano", None)
+
+    plano = st.session_state.get("cad_plano")
+    if plano is not None:
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Nave", f"{plano.ancho_m:,.1f} × {plano.largo_m:,.1f} m")
+        p2.metric("Superficie", f"{plano.ancho_m * plano.largo_m:,.0f} m²")
+        p3.metric("Capas", f"{len(plano.capas)}")
+        p4.metric("Entidades", f"{plano.entidades:,}")
+        st.caption(f"Unidades interpretadas: **{plano.unidad_origen}**. "
+                   "El plano se trasladó a origen conservando proporciones.")
+        for aviso in plano.avisos:
+            st.warning(aviso)
+
+        st.markdown("**Qué es cada capa**")
+        st.caption("La propuesta sale del nombre de la capa; corrígela si hace "
+                   "falta. Lo que quede en «ignorar» no se importa.")
+        capas_seed = pd.DataFrame([
+            {"capa": c.nombre, "rol": c.rol, "elementos": c.entidades,
+             "cerrados": c.cerradas, "área mayor (m²)": c.area_max_m2}
+            for c in sorted(plano.capas.values(),
+                            key=lambda c: -c.entidades)])
+        capas_edit = st.data_editor(
+            capas_seed, width="stretch", hide_index=True,
+            key=f"cad_capas_{st.session_state.get('cad_plano_firma', '')}",
+            column_config={
+                "capa": st.column_config.TextColumn("Capa", disabled=True),
+                "rol": st.column_config.SelectboxColumn(
+                    "Se importa como", options=CAD.ROLES, required=True),
+                "elementos": st.column_config.NumberColumn(
+                    "Elementos", disabled=True),
+                "cerrados": st.column_config.NumberColumn(
+                    "Cerrados", disabled=True,
+                    help="Polilíneas cerradas: son las únicas que definen área."),
+                "área mayor (m²)": st.column_config.NumberColumn(
+                    "Área mayor (m²)", disabled=True, format="%.1f")})
+        roles = dict(zip(capas_edit["capa"], capas_edit["rol"]))
+
+        with st.popover("¿Qué significa cada rol?"):
+            for rol in CAD.ROLES:
+                st.markdown(f"**{rol}** — {CAD.ROL_DESCRIPCION[rol]}")
+
+        previo = CAD.mapear(plano, roles)
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("Perímetro", f"{len(previo['perimetro'])} vértices")
+        v2.metric("Obstáculos", f"{len(previo['obstaculos'])}")
+        v3.metric("Zonas", f"{len(previo['zonas'])}")
+        v4.metric("Accesos", f"{len(previo['accesos'])}")
+
+        fig_cad = viz.plano_importado(previo, plano.ancho_m, plano.largo_m)
+        st.plotly_chart(fig_cad, width="stretch")
+
+        if not previo["perimetro"]:
+            st.warning(
+                "Sin perímetro no se puede definir el área operativa. Marca "
+                "como «perimetro» la capa del muro exterior; debe traer al "
+                "menos una polilínea CERRADA.")
+
+        if st.button("📥 Aplicar el plano al layout", type="primary",
+                     width="stretch",
+                     disabled=not previo["perimetro"]):
+            def _aplicar_plano():
+                st.session_state["perimetro"] = previo["perimetro"]
+                st.session_state["obstaculos"] = previo["obstaculos"]
+                st.session_state["zonas_layout"] = previo["zonas"]
+                st.session_state["accesos"] = previo["accesos"]
+                st.session_state["ancho_m"] = float(previo["ancho_m"])
+                st.session_state["largo_m"] = float(previo["largo_m"])
+                if previo["ubicaciones"]:
+                    st.session_state["slots"] = previo["ubicaciones"]
+                for clave in ("perimetro_rev", "obs_rev", "zonas_layout_rev",
+                              "slots_rev"):
+                    st.session_state[clave] = st.session_state.get(clave, 0) + 1
+                st.session_state.pop("cad_borrador", None)
+                st.session_state.pop("cad_dimensiones_borrador", None)
+
+            confirmar_accion(
+                titulo="Aplicar el plano importado",
+                detalle=(
+                    f"Se reemplazará el área ({previo['ancho_m']:.1f} × "
+                    f"{previo['largo_m']:.1f} m), su contorno, "
+                    f"{len(previo['obstaculos'])} obstáculos, "
+                    f"{len(previo['zonas'])} zonas y "
+                    f"{len(previo['accesos'])} accesos"
+                    + (f", además de {len(previo['ubicaciones'])} ubicaciones"
+                       if previo["ubicaciones"] else "")
+                    + ". El borrador CAD sin guardar se descarta."),
+                al_confirmar=_aplicar_plano,
+                etiqueta_confirmar="Aplicar",
+                clave="aplicar_plano_cad")
 with st.expander("✏️ Editor CAD del área y ubicaciones", expanded=True):
     cad_fuente = st.session_state.get("cad_borrador", {
         "perimetro": st.session_state["perimetro"],

@@ -51,7 +51,7 @@ with continuar:
 with resumen:
     st.metric(
         "Avance del flujo",
-        f"{sum(estado.values())} de 4 etapas ejecutadas",
+        f"{sum(estado.values())} de 5 etapas ejecutadas",
     )
     st.metric("Escenarios guardados", f"{len(escenarios):,}")
 
@@ -98,17 +98,30 @@ tarjetas.extend([
     {
         "col": fila_2[1],
         "kicker": "Paso 4",
-        "title": "Escenarios",
-        "copy": "Consulta versiones guardadas y compara sus resultados.",
-        "destino": "pages/4_Escenarios.py",
-        "estado": (
-            f"{len(escenarios):,} guardados"
-            if len(escenarios) else "Sin escenarios"
+        "title": "Métodos de surtido",
+        "copy": "Compara discreto, lotes y zonas; anima los tres mejores.",
+        "destino": "pages/4_Comparativa.py",
+        "estado": "Completado" if estado["comparativa"] else (
+            "Disponible" if estado["diseno"] else "Requiere paso 2"
         ),
-        "done": bool(len(escenarios)) or estado["escenarios"],
-        "disabled": False,
+        "done": estado["comparativa"],
+        "disabled": not estado["diseno"],
     },
 ])
+fila_3 = st.columns(2)
+tarjetas.append({
+    "col": fila_3[0],
+    "kicker": "Paso 5",
+    "title": "Escenarios",
+    "copy": "Consulta versiones guardadas y compara sus resultados.",
+    "destino": "pages/5_Escenarios.py",
+    "estado": (
+        f"{len(escenarios):,} guardados"
+        if len(escenarios) else "Sin escenarios"
+    ),
+    "done": bool(len(escenarios)) or estado["escenarios"],
+    "disabled": False,
+})
 
 for tarjeta in tarjetas:
     with tarjeta["col"]:

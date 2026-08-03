@@ -677,3 +677,69 @@ def vista_3d(res: dict, color_por: str = "familia",
         margin=dict(l=0, r=0, t=40, b=0),
     )
     return fig
+
+
+# --------------------------------------------------------------------------- #
+# Previsualización de un plano importado
+# --------------------------------------------------------------------------- #
+def plano_importado(mapeado: dict, ancho_m: float, largo_m: float,
+                    altura: int = 460) -> go.Figure:
+    """Dibuja lo que se va a importar de un plano CAD, antes de aplicarlo.
+
+    Su trabajo es que un error de mapeo de capas se vea AQUÍ y no tres pasos
+    después: un perímetro que salió del baño en vez del muro, o columnas
+    marcadas como zonas, saltan a la vista en el dibujo aunque el conteo de
+    elementos parezca razonable.
+    """
+    fig = go.Figure()
+
+    perimetro = mapeado.get("perimetro") or []
+    if len(perimetro) > 2:
+        xs = [p[0] for p in perimetro] + [perimetro[0][0]]
+        ys = [p[1] for p in perimetro] + [perimetro[0][1]]
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", fill="toself",
+            fillcolor="rgba(120,140,170,0.10)",
+            line=dict(color="#4b5b70", width=2.5), name="perímetro",
+            hoverinfo="skip"))
+
+    def _rects(items, color, borde, nombre, texto=None):
+        if not items:
+            return
+        xs, ys = _rects_nan(
+            np.array([float(o["x"]) for o in items]),
+            np.array([float(o["y"]) for o in items]),
+            np.array([float(o["w"]) for o in items]),
+            np.array([float(o["d"]) for o in items]))
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", fill="toself", fillcolor=color,
+            line=dict(color=borde, width=1), name=nombre,
+            hovertext=texto, hoverinfo="text" if texto else "skip"))
+
+    _rects(mapeado.get("ubicaciones"), "rgba(22,163,74,0.20)", "#16a34a",
+           "ubicaciones")
+    _rects(mapeado.get("obstaculos"), "rgba(220,38,38,0.28)", "#b91c1c",
+           "obstáculos")
+    _rects(mapeado.get("accesos"), "rgba(234,88,12,0.45)", "#ea580c",
+           "accesos / andén")
+
+    for i, z in enumerate(mapeado.get("zonas") or []):
+        poly = z.get("poligono") or []
+        if len(poly) < 3:
+            continue
+        xs = [p[0] for p in poly] + [poly[0][0]]
+        ys = [p[1] for p in poly] + [poly[0][1]]
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", fill="toself",
+            fillcolor="rgba(37,99,235,0.13)",
+            line=dict(color="#2563eb", width=1.2),
+            name=str(z.get("nombre") or f"zona {i + 1}"),
+            legendgroup="zonas", showlegend=i == 0, hoverinfo="skip"))
+
+    fig.update_layout(
+        height=altura, margin=dict(l=10, r=10, t=30, b=10),
+        xaxis=dict(title="m", range=[-1, max(ancho_m, 1) + 1]),
+        yaxis=dict(title="m", range=[-1, max(largo_m, 1) + 1],
+                   scaleanchor="x", scaleratio=1),
+        legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+    return fig

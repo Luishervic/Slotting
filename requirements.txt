@@ -3,3 +3,7 @@ pandas>=2.2,<4
 numpy>=1.26,<3
 plotly>=5.20,<7
 openpyxl>=3.1,<4
+# Lectura de planos CAD. DXF se lee directo; para DWG hace falta además el ODA
+# File Converter, que es un ejecutable gratuito de la Open Design Alliance y no
+# se instala con pip (ver README, «Importar el plano de la nave»).
+ezdxf>=1.1,<2

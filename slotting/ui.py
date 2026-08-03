@@ -103,7 +103,13 @@ def estado_flujo() -> dict[str, bool]:
     return {
         "datos": bool(st.session_state.get("alcance_confirmado", False)),
         "diseno": bool(st.session_state.get("slots")),
-        "simulacion": st.session_state.get("sim_output") is not None,
+        # La página de operación guarda `ultima_simulacion`; `sim_output` es el
+        # nombre viejo y se conserva por si quedan sesiones a medias. Sin los
+        # dos, el paso 3 nunca se marcaba como hecho y el menú se quedaba
+        # empujando a simular aunque ya se hubiera simulado.
+        "simulacion": (st.session_state.get("ultima_simulacion") is not None
+                       or st.session_state.get("sim_output") is not None),
+        "comparativa": st.session_state.get("comparativa_metodos") is not None,
         "escenarios": bool(st.session_state.get("ultimo_escenario_id")),
     }
 
@@ -116,7 +122,9 @@ def siguiente_paso() -> tuple[str, str]:
         return "pages/2_Diseno.py", "Diseñar y aplicar el layout"
     if not estado["simulacion"]:
         return "pages/3_Operacion.py", "Simular la operación"
-    return "pages/4_Escenarios.py", "Revisar y comparar escenarios"
+    if not estado["comparativa"]:
+        return "pages/4_Comparativa.py", "Comparar métodos de surtido"
+    return "pages/5_Escenarios.py", "Revisar y comparar escenarios"
 
 
 def cambiar_pagina(destino: str) -> None:
@@ -187,12 +195,15 @@ def navegacion(actual: str | None = None) -> None:
             ("datos", "pages/1_Datos.py", "1. Datos y alcance", "📦"),
             ("diseno", "pages/2_Diseno.py", "2. Diseñar layout", "🗺️"),
             ("simulacion", "pages/3_Operacion.py", "3. Simular operación", "🚚"),
-            ("escenarios", "pages/4_Escenarios.py", "4. Escenarios", "🗂️"),
+            ("comparativa", "pages/4_Comparativa.py",
+             "4. Métodos de surtido", "🏁"),
+            ("escenarios", "pages/5_Escenarios.py", "5. Escenarios", "🗂️"),
         ]
         for clave, destino, etiqueta, icono in pasos:
             bloqueado = (
                 (clave == "diseno" and not estado["datos"])
                 or (clave == "simulacion" and not estado["diseno"])
+                or (clave == "comparativa" and not estado["diseno"])
             )
             terminado = estado.get(clave, False)
             etiqueta_estado = f"{etiqueta}  ✓" if terminado else etiqueta

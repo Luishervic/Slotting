@@ -1,0 +1,499 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  :root {
+    --fondo: #ffffff;
+    --texto: #16202c;
+    --tenue: #6b7785;
+    --borde: #dfe4ea;
+    --modulo: #ccd4de;
+    --modulo-borde: #b3bdc9;
+    --panel: #f7f9fb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fondo: #0e1117; --texto: #e6eaf0; --tenue: #98a2b0;
+      --borde: #2a313c; --modulo: #333c48; --modulo-borde: #454f5d;
+      --panel: #161b22;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--fondo); color: var(--texto);
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    font-size: 13px;
+  }
+  #barra {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 10px; background: var(--panel);
+    border: 1px solid var(--borde); border-radius: 8px; margin-bottom: 8px;
+  }
+  button {
+    font: inherit; font-weight: 600; cursor: pointer; color: var(--texto);
+    background: var(--fondo); border: 1px solid var(--borde);
+    border-radius: 6px; padding: 5px 11px;
+  }
+  button:hover { border-color: var(--tenue); }
+  button.activo { background: #2d9cdb; border-color: #2d9cdb; color: #fff; }
+  #scrub { flex: 1 1 220px; min-width: 160px; accent-color: #2d9cdb; }
+  #reloj {
+    font-variant-numeric: tabular-nums; font-weight: 700; min-width: 118px;
+  }
+  .vel { display: flex; gap: 3px; }
+  .vel button { padding: 5px 8px; }
+  #paneles { display: flex; gap: 8px; align-items: stretch; }
+  .panel {
+    flex: 1 1 0; min-width: 0; border: 1px solid var(--borde);
+    border-radius: 8px; overflow: hidden; background: var(--panel);
+    display: flex; flex-direction: column;
+  }
+  .cab { padding: 7px 9px; border-bottom: 1px solid var(--borde); }
+  .cab .t { font-weight: 700; line-height: 1.25; }
+  .cab .s { color: var(--tenue); font-size: 11.5px; margin-top: 2px; }
+  canvas { display: block; width: 100%; background: var(--fondo); }
+  .avance {
+    padding: 6px 9px; border-top: 1px solid var(--borde);
+    font-variant-numeric: tabular-nums;
+  }
+  .barra-fondo {
+    height: 6px; background: var(--borde); border-radius: 3px;
+    overflow: hidden; margin: 5px 0 6px;
+  }
+  .barra-relleno {
+    height: 100%; width: 0%; background: #27ae60; transition: width .08s linear;
+  }
+  .kpis {
+    display: grid; grid-template-columns: 1fr auto; gap: 1px 8px;
+    font-size: 11.5px; color: var(--tenue);
+  }
+  .kpis b { color: var(--texto); font-variant-numeric: tabular-nums; }
+  .terminado { color: #27ae60; font-weight: 700; }
+  #leyenda {
+    display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px;
+    color: var(--tenue); font-size: 11.5px; align-items: center;
+  }
+  #leyenda i {
+    width: 10px; height: 10px; border-radius: 50%; display: inline-block;
+    margin-right: 4px; vertical-align: -1px;
+  }
+</style>
+</head>
+<body>
+<div id="barra">
+  <button id="play">▶ Reproducir</button>
+  <button id="reinicio">⟲ Reiniciar</button>
+  <input type="range" id="scrub" min="0" max="1000" value="0" step="1" />
+  <span id="reloj">00:00:00</span>
+  <span class="vel" id="velocidades"></span>
+  <label style="color:var(--tenue)">
+    <input type="checkbox" id="rastro" /> rastro
+  </label>
+</div>
+<div id="paneles"></div>
+<div id="leyenda"></div>
+
+<script>
+const Streamlit = {
+  setComponentReady() {
+    window.parent.postMessage(
+      {isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1}, "*");
+  },
+  setFrameHeight(h) {
+    window.parent.postMessage(
+      {isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: h}, "*");
+  },
+};
+
+let DATOS = null, paneles = [], reproduciendo = false, t = 0, velocidad = 60;
+let ultimoFrame = null, rastroOn = false;
+const VELOCIDADES = [10, 30, 60, 120, 300];
+
+/* ------------------------------------------------------------------ */
+/* Construcción                                                        */
+/* ------------------------------------------------------------------ */
+function construir(d) {
+  DATOS = d;
+  velocidad = d.velocidad || 60;
+  const cont = document.getElementById("paneles");
+  cont.innerHTML = "";
+  paneles = [];
+
+  const g = d.geometria;
+  // El plano se dibuja una sola vez por panel en un lienzo fuera de pantalla:
+  // en cada cuadro sólo se copia esa imagen y se pintan los operadores. Con
+  // cientos de módulos, redibujar el layout 30 veces por segundo tira el
+  // cuadro por suelo y la animación se ve a tirones.
+  const anchoPanel = Math.max(
+    180, Math.floor((cont.clientWidth || 900) / d.paneles.length) - 10);
+  const escala = calcularEscala(g, anchoPanel);
+
+  d.paneles.forEach((p, i) => {
+    const div = document.createElement("div");
+    div.className = "panel";
+    div.innerHTML = `
+      <div class="cab">
+        <div class="t">${escapar(p.nombre)}</div>
+        <div class="s">${escapar(p.subtitulo)}</div>
+      </div>
+      <canvas></canvas>
+      <div class="avance">
+        <div class="barra-fondo"><div class="barra-relleno"></div></div>
+        <div class="kpis"></div>
+      </div>`;
+    cont.appendChild(div);
+
+    const cv = div.querySelector("canvas");
+    const dpr = window.devicePixelRatio || 1;
+    cv.width = escala.w * dpr;
+    cv.height = escala.h * dpr;
+    cv.style.height = escala.h + "px";
+    const ctx = cv.getContext("2d");
+    ctx.scale(dpr, dpr);
+
+    const fondo = document.createElement("canvas");
+    fondo.width = cv.width;
+    fondo.height = cv.height;
+    const fctx = fondo.getContext("2d");
+    fctx.scale(dpr, dpr);
+    dibujarFondo(fctx, g, p, escala);
+
+    paneles.push({
+      spec: p, ctx, fondo, escala, dpr,
+      relleno: div.querySelector(".barra-relleno"),
+      kpis: div.querySelector(".kpis"),
+      // Un cursor por operador evita rebuscar la lista completa de eventos en
+      // cada cuadro: los eventos de un operador están ordenados en el tiempo.
+      porOp: agruparPorOperador(p.eventos, p.n_operadores),
+      cursor: new Array(p.n_operadores).fill(0),
+      rastro: [],
+    });
+    pintarKpis(paneles[i], 0);
+  });
+
+  dibujarLeyenda();
+  render(0);
+  ajustarAltura();
+}
+
+function calcularEscala(g, anchoDisp) {
+  const margen = 8;
+  const ancho = Math.max(g.ancho, 0.1), largo = Math.max(g.largo, 0.1);
+  const k = (anchoDisp - 2 * margen) / ancho;
+  const altoMax = (DATOS.height || 620) - 210;
+  const kFinal = Math.min(k, (altoMax - 2 * margen) / largo);
+  return {
+    k: kFinal, margen,
+    w: anchoDisp,
+    h: Math.round(largo * kFinal + 2 * margen),
+    largo,
+  };
+}
+
+/* Coordenadas de nave (origen abajo-izquierda) a lienzo (origen arriba). */
+function px(e, x) { return e.margen + x * e.k; }
+function py(e, y) { return e.margen + (e.largo - y) * e.k; }
+
+function agruparPorOperador(eventos, n) {
+  const out = [];
+  for (let i = 0; i < n; i++) out.push([]);
+  for (const ev of eventos) {
+    if (ev.op < n) out[ev.op].push(ev);
+  }
+  out.forEach(l => l.sort((a, b) => a.t0 - b.t0));
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Dibujo                                                              */
+/* ------------------------------------------------------------------ */
+function estilo(v) {
+  return getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+}
+
+function dibujarFondo(ctx, g, p, e) {
+  ctx.clearRect(0, 0, e.w, e.h);
+
+  for (const z of (p.zonas || [])) {
+    const [x, y, w, d] = z.bbox;
+    ctx.fillStyle = z.color;
+    ctx.fillRect(px(e, x), py(e, y + d), w * e.k, d * e.k);
+    ctx.strokeStyle = z.color.replace(/0\.13\)$/, "0.5)");
+    ctx.lineWidth = 1;
+    ctx.strokeRect(px(e, x), py(e, y + d), w * e.k, d * e.k);
+  }
+
+  if (g.perimetro && g.perimetro.length > 2) {
+    ctx.beginPath();
+    g.perimetro.forEach((pt, i) => {
+      const fx = px(e, pt[0]), fy = py(e, pt[1]);
+      i === 0 ? ctx.moveTo(fx, fy) : ctx.lineTo(fx, fy);
+    });
+    ctx.closePath();
+    ctx.strokeStyle = estilo("--tenue");
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  } else {
+    ctx.strokeStyle = estilo("--borde");
+    ctx.strokeRect(px(e, 0), py(e, g.largo), g.ancho * e.k, g.largo * e.k);
+  }
+
+  ctx.fillStyle = estilo("--modulo");
+  ctx.strokeStyle = estilo("--modulo-borde");
+  ctx.lineWidth = 0.5;
+  const fino = e.k < 3;
+  for (const [x, y, w, d] of g.modulos) {
+    const fx = px(e, x), fy = py(e, y + d);
+    ctx.fillRect(fx, fy, Math.max(w * e.k, 1), Math.max(d * e.k, 1));
+    if (!fino) ctx.strokeRect(fx, fy, w * e.k, d * e.k);
+  }
+
+  ctx.fillStyle = "rgba(235,87,87,0.35)";
+  for (const [x, y, w, d] of (g.obstaculos || [])) {
+    ctx.fillRect(px(e, x), py(e, y + d), w * e.k, d * e.k);
+  }
+
+  // Depot
+  const dx = px(e, g.depot[0]), dy = py(e, g.depot[1]);
+  ctx.fillStyle = estilo("--texto");
+  ctx.beginPath();
+  ctx.moveTo(dx, dy - 7);
+  ctx.lineTo(dx + 6, dy + 4);
+  ctx.lineTo(dx - 6, dy + 4);
+  ctx.closePath();
+  ctx.fill();
+}
+
+/* Posición de un operador en el instante t, interpolando por longitud de arco
+   sobre la polilínea del tramo. Devuelve null si aún no arranca o ya terminó. */
+function posicionOp(lista, cursor, t) {
+  let i = cursor;
+  while (i < lista.length && lista[i].t1 < t) i++;
+  if (i >= lista.length) return {pos: null, cursor: lista.length, ev: null};
+  const ev = lista[i];
+  if (ev.t0 > t) {
+    // Entre dos tareas: se queda donde terminó la anterior.
+    const prev = i > 0 ? lista[i - 1] : null;
+    const p = prev ? prev.pts[prev.pts.length - 1] : null;
+    return {pos: p, cursor: i, ev: null};
+  }
+  const pts = ev.pts;
+  if (!pts || pts.length === 0) return {pos: null, cursor: i, ev};
+  if (pts.length === 1) return {pos: pts[0], cursor: i, ev};
+
+  const dur = Math.max(ev.t1 - ev.t0, 1e-6);
+  const frac = Math.min(Math.max((t - ev.t0) / dur, 0), 1);
+  let total = 0;
+  const largos = [];
+  for (let j = 1; j < pts.length; j++) {
+    const l = Math.hypot(pts[j][0] - pts[j - 1][0], pts[j][1] - pts[j - 1][1]);
+    largos.push(l);
+    total += l;
+  }
+  if (total <= 0) return {pos: pts[0], cursor: i, ev};
+  let meta = frac * total, acum = 0;
+  for (let j = 0; j < largos.length; j++) {
+    if (acum + largos[j] >= meta) {
+      const f = largos[j] > 0 ? (meta - acum) / largos[j] : 0;
+      return {
+        pos: [pts[j][0] + (pts[j + 1][0] - pts[j][0]) * f,
+              pts[j][1] + (pts[j + 1][1] - pts[j][1]) * f],
+        cursor: i, ev,
+      };
+    }
+    acum += largos[j];
+  }
+  return {pos: pts[pts.length - 1], cursor: i, ev};
+}
+
+function render(t) {
+  for (const P of paneles) {
+    const {ctx, escala: e} = P;
+    ctx.clearRect(0, 0, e.w, e.h);
+    ctx.drawImage(P.fondo, 0, 0, e.w, e.h);
+
+    if (rastroOn && P.rastro.length > 1) {
+      ctx.strokeStyle = "rgba(230,71,47,0.18)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (const seg of P.rastro) {
+        ctx.moveTo(px(e, seg[0]), py(e, seg[1]));
+        ctx.lineTo(px(e, seg[2]), py(e, seg[3]));
+      }
+      ctx.stroke();
+    }
+
+    for (let op = 0; op < P.porOp.length; op++) {
+      const r = posicionOp(P.porOp[op], P.cursor[op], t);
+      P.cursor[op] = r.cursor;
+      if (!r.pos) continue;
+      const tipo = r.ev ? r.ev.tipo : "espera";
+      const cx = px(e, r.pos[0]), cy = py(e, r.pos[1]);
+
+      if (rastroOn && r.ev && r.ev.tipo === "recorrido" && P.ultima &&
+          P.ultima[op]) {
+        P.rastro.push([P.ultima[op][0], P.ultima[op][1], r.pos[0], r.pos[1]]);
+        if (P.rastro.length > 4000) P.rastro.shift();
+      }
+      if (!P.ultima) P.ultima = [];
+      P.ultima[op] = r.pos;
+
+      // Halo tenue para que el operador se distinga sobre los módulos.
+      ctx.beginPath();
+      ctx.arc(cx, cy, 7, 0, 6.2832);
+      ctx.fillStyle = "rgba(255,255,255,0.55)";
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(cx, cy, 4.5, 0, 6.2832);
+      ctx.fillStyle = DATOS.colores[tipo] || DATOS.colores.espera;
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(0,0,0,0.35)";
+      ctx.stroke();
+    }
+    pintarKpis(P, t);
+  }
+}
+
+function pintarKpis(P, t) {
+  const fin = P.spec.fin_pedidos;
+  let lo = 0, hi = fin.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (fin[mid] <= t) lo = mid + 1; else hi = mid;
+  }
+  const hechos = lo, total = P.spec.total_pedidos || 1;
+  const pct = Math.min(100 * hechos / total, 100);
+  P.relleno.style.width = pct + "%";
+  const listo = hechos >= total;
+  const filas = [
+    `<span>Pedidos completos</span>` +
+    `<b class="${listo ? "terminado" : ""}">${hechos} / ${total}` +
+    `${listo ? " ✓" : ""}</b>`,
+  ];
+  for (const [k, v] of Object.entries(P.spec.kpis)) {
+    filas.push(`<span>${escapar(k)}</span><b>${escapar(String(v))}</b>`);
+  }
+  P.kpis.innerHTML = filas.join("");
+}
+
+function dibujarLeyenda() {
+  const etiquetas = {
+    recorrido: "caminando y surtiendo", clasificar: "clasificando el lote",
+    traspaso: "traspaso entre zonas", espera: "esperando trabajo",
+  };
+  document.getElementById("leyenda").innerHTML =
+    Object.entries(etiquetas).map(([k, v]) =>
+      `<span><i style="background:${DATOS.colores[k]}"></i>${v}</span>`
+    ).join("") +
+    `<span style="margin-left:auto">▲ andén · sombreado = zona de picking` +
+    `</span>`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Reproducción                                                        */
+/* ------------------------------------------------------------------ */
+function hhmmss(s) {
+  s = Math.max(0, Math.floor(s));
+  const h = String(Math.floor(s / 3600)).padStart(2, "0");
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+  return `${h}:${m}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function fijarTiempo(nuevo, reiniciarCursores) {
+  t = Math.min(Math.max(nuevo, 0), DATOS.t_max);
+  if (reiniciarCursores) {
+    for (const P of paneles) {
+      P.cursor.fill(0);
+      P.rastro = [];
+      P.ultima = null;
+    }
+  }
+  document.getElementById("reloj").textContent =
+    hhmmss(t) + " / " + hhmmss(DATOS.t_max);
+  document.getElementById("scrub").value =
+    Math.round(1000 * t / Math.max(DATOS.t_max, 1e-6));
+  render(t);
+}
+
+function bucle(ahora) {
+  if (!reproduciendo) return;
+  if (ultimoFrame === null) ultimoFrame = ahora;
+  const dt = Math.min((ahora - ultimoFrame) / 1000, 0.25);
+  ultimoFrame = ahora;
+  fijarTiempo(t + dt * velocidad, false);
+  if (t >= DATOS.t_max) {
+    reproduciendo = false;
+    document.getElementById("play").textContent = "▶ Reproducir";
+    return;
+  }
+  requestAnimationFrame(bucle);
+}
+
+function ajustarAltura() {
+  Streamlit.setFrameHeight(document.body.scrollHeight + 12);
+}
+
+function escapar(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+}
+
+document.getElementById("play").onclick = () => {
+  reproduciendo = !reproduciendo;
+  document.getElementById("play").textContent =
+    reproduciendo ? "❚❚ Pausa" : "▶ Reproducir";
+  if (reproduciendo) {
+    if (t >= DATOS.t_max) fijarTiempo(0, true);
+    ultimoFrame = null;
+    requestAnimationFrame(bucle);
+  }
+};
+document.getElementById("reinicio").onclick = () => fijarTiempo(0, true);
+document.getElementById("scrub").oninput = (ev) => {
+  const nuevo = DATOS.t_max * ev.target.value / 1000;
+  // Al saltar hacia atrás hay que reconstruir los cursores desde cero.
+  fijarTiempo(nuevo, nuevo < t);
+};
+document.getElementById("rastro").onchange = (ev) => {
+  rastroOn = ev.target.checked;
+  for (const P of paneles) { P.rastro = []; P.ultima = null; }
+  render(t);
+};
+
+function construirVelocidades() {
+  const cont = document.getElementById("velocidades");
+  cont.innerHTML = "";
+  VELOCIDADES.forEach(v => {
+    const b = document.createElement("button");
+    b.textContent = v + "×";
+    b.title = `${v} segundos simulados por segundo real`;
+    b.onclick = () => {
+      velocidad = v;
+      [...cont.children].forEach(c => c.classList.remove("activo"));
+      b.classList.add("activo");
+    };
+    if (v === velocidad) b.classList.add("activo");
+    cont.appendChild(b);
+  });
+}
+
+window.addEventListener("message", (ev) => {
+  if (!ev.data || ev.data.type !== "streamlit:render") return;
+  const args = ev.data.args;
+  if (!args || !args.paneles) return;
+  construir(args);
+  construirVelocidades();
+  fijarTiempo(0, true);
+});
+
+window.addEventListener("resize", () => {
+  if (DATOS) { construir(DATOS); fijarTiempo(t, true); }
+});
+
+Streamlit.setComponentReady();
+Streamlit.setFrameHeight(640);
+</script>
+</body>
+</html>
