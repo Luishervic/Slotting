@@ -80,16 +80,40 @@ source_name = None
 source_signature = None
 
 if source_mode == "Maestro generado":
-    zone = st.selectbox("Zona física", sorted(masters))
-    source_path = masters[zone]
-    dataframe, metadata = CX.cargar_zona(
-        zone, catalogos=catalogs, cedis=facility
+    # Varias zonas a la vez: un espacio físico no siempre corresponde a una
+    # sola zona lógica, y conviene mezclarlas cuando comparten equipo de
+    # surtido o cuando una es demasiado chica para justificar su propia área.
+    zones = st.multiselect(
+        "Zonas físicas del alcance", sorted(masters),
+        default=[sorted(masters)[0]],
+        help="Puedes combinar más de una. Cada SKU conserva su zona de origen, "
+             "así que en el paso de diseño podrás reservar áreas del layout "
+             "por zona.")
+    if not zones:
+        st.info("Elige al menos una zona física para continuar.")
+        st.stop()
+    dataframe, metadata = CX.cargar_zonas(
+        zones, catalogos=catalogs, cedis=facility
     )
-    source_name = source_path.name
-    stat = source_path.stat()
-    source_signature = (
-        f"{facility.codigo}:{source_path}:{stat.st_mtime_ns}:{stat.st_size}"
-    )
+    paths = sorted({masters[z] for z in zones})
+    source_name = " + ".join(sorted(zones))
+    firmas = ":".join(
+        f"{p}:{p.stat().st_mtime_ns}:{p.stat().st_size}" for p in paths)
+    source_signature = f"{facility.codigo}:{firmas}"
+
+    if len(zones) > 1:
+        reparto = metadata.get("por_zona", {})
+        st.caption("Alcance combinado: "
+                   + " · ".join(f"**{z}** {n:,} SKU"
+                                for z, n in reparto.items()))
+    dup = metadata.get("duplicados_entre_zonas") or {}
+    if dup:
+        total = sum(len(v) for v in dup.values())
+        st.warning(
+            f"{total} SKU aparecen en más de un maestro y se conservaron una "
+            "sola vez, con la primera zona en el orden elegido. Suele ser un "
+            "error de los maestros: revisa "
+            + ", ".join(f"{z} ({len(v)})" for z, v in dup.items()) + ".")
 else:
     uploaded = st.file_uploader("Archivo CSV de SKU", type=["csv"])
     if uploaded is not None:

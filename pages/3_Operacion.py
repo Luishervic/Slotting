@@ -13,6 +13,8 @@ ventaja no es caminar menos, es caminar en paralelo.
 """
 from __future__ import annotations
 
+import io as _io
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -24,24 +26,26 @@ from slotting import contexto as CX
 from slotting import demanda as DM
 from slotting import entrega as EN
 from slotting import metodos as MT
+from slotting import parametros as PAR
 from slotting import rutas as RT
 from slotting import sim as SIM
 from slotting import viz
 from slotting import zonificacion as ZN
 from slotting.engine.registry import get_profile
 from slotting.geometry import normalizar_poligono, rectangulo_en_poligono
-from slotting.paths import PROJECT_ROOT
-from slotting.ui import navegacion, titulo_pagina
+from slotting.paths import PROJECT_ROOT, SCENARIO_DB
+from slotting.scenario_store import ScenarioStore
+from slotting.ui import confirmar_accion, navegacion, titulo_pagina
 
 S = get_profile(st.session_state.get("cedis_engine_profile", "default"))
 
-st.set_page_config(page_title="Métodos de surtido | Slotting",
+st.set_page_config(page_title="Operación | Slotting",
                    page_icon="🏁", layout="wide")
-navegacion("comparativa")
+navegacion("operacion")
 titulo_pagina(
-    "Paso 4 de 5",
-    "Métodos de surtido",
-    "Compara cómo organizar el trabajo sobre el layout que ya diseñaste.",
+    "Paso 3 de 4",
+    "Operación y métodos de surtido",
+    "Simula el surtido sobre tu layout y compara cómo organizar el trabajo.",
 )
 
 if "df" not in st.session_state:
@@ -120,137 +124,50 @@ if not topo.confiable:
 with st.sidebar:
     st.header("Demanda")
     fuente = st.radio(
-        "Origen de los pedidos", ["historico", "sintetica"],
-        format_func={"historico": "📚 Histórico real del CEDIS",
+        "Origen de los pedidos", ["historico", "csv", "sintetica"],
+        format_func={"historico": "📚 Histórico del CEDIS",
+                     "csv": "📄 Archivo de salidas (CSV)",
                      "sintetica": "🧪 Sintética (por clase ABC)"}.get,
         key="fuente_demanda_comparativa",
         help="El histórico es la única fuente con la que la comparativa es "
              "defendible: trae el tamaño y la mezcla reales de los pedidos.")
-    seed = st.number_input("Semilla", 0, 9999, 42, 1)
     n_muestra = st.slider("Recorridos a simular", 40, 800, 200, 20,
-                          help="Cada corrida del barrido cuesta proporcional a "
-                               "esto. 200 da una señal estable.")
+                          help="Cada corrida del barrido cuesta proporcional "
+                               "a esto. 200 da una señal estable.")
     if fuente == "sintetica":
-        lineas_media = st.slider("Líneas por pedido (media)", 1.0, 15.0, 4.0, 0.5)
-        unid_media = st.slider("Unidades por línea (media)", 1.0, 10.0, 1.0, 0.5)
+        lineas_media = st.slider("Líneas por pedido (media)",
+                                 1.0, 15.0, 4.0, 0.5)
+        unid_media = st.slider("Unidades por línea (media)",
+                               1.0, 10.0, 1.0, 0.5)
 
-    st.header("Cuadrilla")
-    n_ops = st.slider("Operadores en el turno", 1, 30, 8, 1,
-                      help="El ganador depende de este número: con poca gente "
-                           "zonificar no compra nada.")
-    horas_turno = st.number_input("Horas por turno", 1.0, 24.0, 8.0, 0.5)
+    # Todos los parámetros de operación viven en un solo lugar y se comparten
+    # con el resto de la aplicación: capturarlos aquí los deja capturados
+    # en cualquier otra vista que simule.
+    _par = PAR.panel_operacion(cfg_aco, con_interferencia=True,
+                               con_metodo=True)
 
-    st.header("Tiempos de operación")
-    vel = st.slider("Velocidad de recorrido (m/s)", 0.3, 3.0, 1.0, 0.1)
-    t_pick = st.number_input("Tiempo por línea (s)", 5.0, 300.0, 45.0, 5.0)
-    t_posic = st.number_input(
-        "Posicionarse en la ubicación (s)", 0.0, 120.0, 10.0, 1.0,
-        help="Se paga una vez por PARADA, no por línea: es el ahorro de que "
-             "dos SKUs del pedido compartan ubicación.")
-    t_fijo = st.number_input(
-        "Tiempo fijo por viaje al andén (s)", 0.0, 600.0, 120.0, 10.0,
-        help="Preparar, descargar, flejar y documentar. Sólo lo pagan los "
-             "métodos que salen y regresan del andén.")
-    cap_uni = st.number_input(
-        "Máx. unidades por viaje (0 = sin límite)", 0.0, 999.0, 0.0, 1.0,
-        help="El tope físico del equipo. Con electrodomésticos suele ser lo "
-             "que decide si el surtido por lotes es siquiera posible.")
-
-    st.header("Organización del trabajo")
-    ped_lote = st.slider("Pedidos por lote", 2, 20, 6, 1)
-    t_clas = st.number_input("Clasificar el lote (s por línea)",
-                             0.0, 120.0, 12.0, 1.0)
-    ped_carro = st.slider("Posiciones del carro (cluster)", 2, 12, 4, 1)
-    t_clas_pick = st.number_input("Clasificar al pick (s por línea)",
-                                  0.0, 120.0, 6.0, 1.0)
-    n_zonas = st.slider("Zonas de picking", 2, 10, 4, 1)
-    t_traspaso = st.number_input("Traspaso entre zonas (s)",
-                                 0.0, 300.0, 45.0, 5.0)
-    t_consol = st.number_input("Consolidar el pedido (s)",
-                               0.0, 600.0, 90.0, 10.0)
-    ventana_ola = st.number_input("Ventana de oleada (min)",
-                                  5.0, 240.0, 30.0, 5.0)
-    ped_ola = st.slider("Pedidos por oleada", 4, 100, 24, 2)
-
-    st.header("Interferencia entre operadores")
-    factor_int = st.slider(
-        "Cuánto se estorban en el pasillo", 0.0, 1.0, 0.35, 0.05,
-        help="0 = el pasillo es ancho y se rebasan sin problema. 1 = bloqueo "
-             "total, hay que esperar a que el otro salga. No sale de los "
-             "datos: calíbralo observando piso.")
-    st.caption(
-        "Sin esto, los métodos que concentran gente en menos pasillos —lotes y "
-        "zonas— ganan por una eficiencia que en piso no existe.")
-
-    st.header("Andén (inicio y fin del recorrido)")
-    entrega_modo = st.radio(
-        "Cómo es el andén", list(EN.MODOS),
-        format_func=lambda m: EN.MODOS[m]["nombre"],
-        index=1,
-        help="Un andén corrido no es un punto: cada recorrido entrega en el "
-             "tramo que le queda enfrente.")
-    st.caption(EN.MODOS[entrega_modo]["ayuda"])
-    entrega_lado, ent_desde, ent_hasta = "frente", None, None
-    dep_x = float(cfg_aco.ancho_m) / 2
-    dep_y = 0.0
-    if entrega_modo == "punto":
-        dep_x = st.slider("Depot X (m)", 0.0, float(cfg_aco.ancho_m),
-                          float(cfg_aco.ancho_m / 2), 0.5)
-        dep_y = st.slider("Depot Y (m)", 0.0, float(cfg_aco.largo_m), 0.0, 0.5)
-    elif entrega_modo == "lado":
-        entrega_lado = st.selectbox(
-            "Lado del andén", list(EN.LADOS),
-            format_func=lambda k: EN.LADOS[k])
-        largo_lado = (float(cfg_aco.ancho_m)
-                      if entrega_lado in ("frente", "fondo")
-                      else float(cfg_aco.largo_m))
-        if st.checkbox("El andén no ocupa todo el lado"):
-            ent_desde, ent_hasta = st.slider(
-                "Tramo con andén (m)", 0.0, largo_lado,
-                (0.0, largo_lado), 0.5,
-                help="Pocas naves tienen andén en todo lo largo; suponerlo "
-                     "regala distancia a los pasillos lejanos.")
-    else:
-        n_acc = len(st.session_state.get("accesos", []))
-        if n_acc:
-            st.caption(f"{n_acc} accesos dibujados o importados del plano.")
-        else:
-            st.warning("No hay accesos dibujados. Dibújalos en el editor CAD "
-                       "del paso de Diseño o impórtalos de un plano.")
-    retiro = st.number_input(
-        "Separación del muro (m)", 0.0, 5.0, 0.5, 0.1,
-        help="El surtidor entrega frente al andén, no encima del muro.")
-
-cfg_sim = SIM.SimConfig(
-    velocidad_mps=vel, t_pick_s=t_pick, t_posicionarse_s=t_posic,
-    t_fijo_s=t_fijo, cap_unidades_viaje=float(cap_uni),
-    n_operadores=int(n_ops), horas_turno=float(horas_turno),
-    depot_x=dep_x, depot_y=dep_y, seed=int(seed),
-    entrega_modo=entrega_modo, entrega_lado=entrega_lado,
-    entrega_desde=ent_desde, entrega_hasta=ent_hasta,
-    entrega_retiro_m=float(retiro),
-    n_pedidos=int(n_muestra),
-    lineas_media=lineas_media if fuente == "sintetica" else 3.0,
-    unidades_media=unid_media if fuente == "sintetica" else 1.0)
-
-cfg_met = MT.MetodoConfig(
-    n_operadores=int(n_ops), pedidos_por_lote=int(ped_lote),
-    t_clasificar_linea_s=float(t_clas), pedidos_por_carro=int(ped_carro),
-    t_clasificar_pick_s=float(t_clas_pick), n_zonas=int(n_zonas),
-    t_traspaso_s=float(t_traspaso), t_consolidar_pedido_s=float(t_consol),
-    ventana_oleada_min=float(ventana_ola), pedidos_por_oleada=int(ped_ola),
-    factor_interferencia=float(factor_int))
+cfg_sim = SIM.SimConfig(**{**_par["sim"].__dict__,
+                          "n_pedidos": int(n_muestra),
+                          "lineas_media": (lineas_media
+                                           if fuente == "sintetica" else 3.0),
+                          "unidades_media": (unid_media
+                                             if fuente == "sintetica"
+                                             else 1.0)})
+cfg_met = _par["metodo"]
+factor_int = _par["factor_interferencia"]
+seed = cfg_sim.seed
+n_ops = cfg_sim.n_operadores
+n_zonas = cfg_met.n_zonas
 
 res["accesos"] = st.session_state.get("accesos", [])
 frente = EN.desde_config(cfg_sim, float(cfg_aco.ancho_m),
                          float(cfg_aco.largo_m), res["accesos"])
 depot = frente.punto_medio()
-if entrega_modo != "punto" and frente.modo == "punto":
+if cfg_sim.entrega_modo != "punto" and frente.modo == "punto":
     st.warning(
-        f"Pediste un andén «{EN.MODOS[entrega_modo]['nombre']}» pero no se "
-        "pudo construir; se está usando un punto único. Si elegiste accesos, "
-        "dibújalos primero en el editor CAD.")
-
+        f"Pediste un andén «{EN.MODOS[cfg_sim.entrega_modo]['nombre']}» pero "
+        "no se pudo construir; se está usando un punto único. Si elegiste "
+        "accesos, dibújalos primero en el editor CAD.")
 # --------------------------------------------------------------------------- #
 # Pedidos
 # --------------------------------------------------------------------------- #
@@ -296,6 +213,73 @@ if fuente == "historico":
             f"como hoy se arma el trabajo en {codigo}. La clase ABC se "
             "recalcula por frecuencia de línea sobre esta ventana.")
         origen_txt = f"histórico {codigo}" + (f" · {zona}" if zona else "")
+elif fuente == "csv":
+    with st.expander("📄 Archivo de salidas (una fila por línea de pedido)",
+                     expanded=st.session_state.get("salidas_df") is None):
+        subido = st.file_uploader(
+            "CSV con pedido, SKU y, opcionalmente, cantidad y fecha",
+            type=["csv"], key="upl_salidas")
+        if subido is not None:
+            try:
+                crudo = subido.getvalue().decode("utf-8-sig", errors="replace")
+                st.session_state["salidas_df"] = pd.read_csv(
+                    _io.StringIO(crudo), sep=None, engine="python")
+                st.session_state["salidas_nombre"] = subido.name
+            except Exception as exc:
+                st.error(f"No pude leer el CSV: {exc}")
+        sdf = st.session_state.get("salidas_df")
+        if sdf is None:
+            st.info("Sube tu archivo de salidas, o cambia la fuente en el "
+                    "panel lateral.")
+            st.stop()
+        st.caption(f"**{st.session_state.get('salidas_nombre', 'archivo')}** — "
+                   f"{len(sdf):,} filas · {len(sdf.columns)} columnas")
+
+        guess = SIM.adivinar_columnas_salidas(sdf.columns)
+        cols = list(sdf.columns)
+        opc = ["(ninguna)"] + cols
+        cA, cB, cC, cD = st.columns(4)
+        col_ped = cA.selectbox("Columna de pedido", cols,
+                               index=cols.index(guess["pedido"])
+                               if guess["pedido"] else 0)
+        col_sku = cB.selectbox("Columna de SKU", cols,
+                               index=cols.index(guess["sku"])
+                               if guess["sku"] else 0)
+        col_cant = cC.selectbox("Columna de cantidad", opc,
+                                index=opc.index(guess["cantidad"])
+                                if guess["cantidad"] else 0)
+        col_fec = cD.selectbox("Columna de fecha", opc,
+                               index=opc.index(guess["fecha"])
+                               if guess["fecha"] else 0)
+        col_cant = None if col_cant == "(ninguna)" else col_cant
+        col_fec = None if col_fec == "(ninguna)" else col_fec
+
+        d_uso = sdf
+        if col_fec:
+            fechas = pd.to_datetime(sdf[col_fec], errors="coerce",
+                                    dayfirst=True)
+            if fechas.notna().any():
+                fmin, fmax = fechas.min().date(), fechas.max().date()
+                rango = st.date_input("Rango de fechas", (fmin, fmax),
+                                      min_value=fmin, max_value=fmax)
+                if isinstance(rango, (list, tuple)) and len(rango) == 2:
+                    d_uso = sdf[(fechas.dt.date >= rango[0])
+                                & (fechas.dt.date <= rango[1])]
+            else:
+                st.warning("La columna de fecha no se pudo interpretar; se "
+                           "usan todas las filas.")
+
+        pedidos = SIM.pedidos_desde_csv(d_uso, col_ped, col_sku, col_cant)
+        if len(pedidos) > int(n_muestra):
+            rng = np.random.default_rng(int(seed))
+            idx = rng.choice(len(pedidos), size=int(n_muestra), replace=False)
+            pedidos = [pedidos[i] for i in sorted(idx)]
+        if not pedidos:
+            st.error("El archivo no produjo ningún pedido con estas columnas.")
+            st.stop()
+        st.caption(f"➡️ **{len(pedidos):,} pedidos** muestreados de "
+                   f"{len(d_uso):,} líneas.")
+        origen_txt = st.session_state.get("salidas_nombre", "CSV de salidas")
         if zona:
             st.session_state["comparativa_zona"] = zona
 else:
@@ -328,13 +312,13 @@ if len(_cruce) < 0.5 * len(_skus_demanda):
         "comparativa mide menos trabajo del real.")
 
 n_lineas = sum(len(p["lineas"]) for p in pedidos)
-st.caption(f"Comparando **{len(pedidos):,} recorridos** · {n_lineas:,} líneas "
-           f"· {origen_txt} · {n_ops} operadores.")
+st.caption(f"**{len(pedidos):,} recorridos** · {n_lineas:,} líneas · "
+           f"{origen_txt}\n\n{PAR.resumen_operacion(cfg_sim)}")
 
 # --------------------------------------------------------------------------- #
-t_ref, t_comp, t_anim, t_curva, t_zonas, t_int = st.tabs([
-    "📚 Los métodos", "🏁 Comparativa", "🎬 Animación",
-    "📈 Curva de operadores", "🗺️ Corte de zonas", "🚧 Interferencia"])
+t_comp, t_anim, t_ruta, t_curva, t_zonas, t_int, t_ref = st.tabs([
+    "🏁 Comparativa", "🎬 Animación", "🗺️ Recorridos",
+    "📈 Cuadrilla", "🧩 Zonas", "🚧 Interferencia", "📚 Referencia"])
 
 # --------------------------------------------------------------------------- #
 with t_ref:
@@ -916,3 +900,193 @@ with t_int:
                 "estorbarse. El punto donde la línea azul deja de subir es el "
                 "límite práctico de esta nave: más allá, contratar sólo agrega "
                 "gente esperando en el pasillo.")
+
+# --------------------------------------------------------------------------- #
+with t_ruta:
+    st.caption(
+        "El detalle de UN recorrido sobre el layout: por dónde pasa, dónde se "
+        "detiene y qué posiciones se visitan más. Sirve para verificar que la "
+        "ruta que calcula el motor es la que haría un surtidor, antes de creerle "
+        "a los promedios.")
+    esc_r = st.session_state.get("comparativa_puntuada")
+    pol_r = "vecino_mas_cercano"
+    if esc_r is not None and not esc_r.empty:
+        cual_r = st.selectbox(
+            "Política de recorrido a inspeccionar",
+            sorted(esc_r["politica"].unique()),
+            format_func=lambda p: RT.POLITICAS[p]["nombre"], key="ruta_pol")
+        pol_r = cual_r
+        st.caption(RT.POLITICAS[pol_r]["descripcion"])
+
+    with st.spinner("Trazando recorridos…"):
+        det = SIM.simular(
+            df, res,
+            SIM.SimConfig(**{**cfg_sim.__dict__, "politica_ruta": pol_r}),
+            pedidos=st.session_state.get("comparativa_pedidos", pedidos),
+            max_rutas=40)
+    kd = det["kpis"]
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Distancia media / pedido",
+              f"{kd['dist_media_pedido_m']:,.0f} m")
+    d2.metric("Tiempo medio / pedido", f"{kd['t_medio_pedido_min']:.1f} min")
+    d3.metric("Paradas / pedido", f"{kd['paradas_media_pedido']:.1f}")
+    d4.metric("Distancia total", f"{kd['dist_total_km']:.1f} km")
+    if kd["politica_sustituida"]:
+        st.warning(
+            f"«{RT.POLITICAS[kd['politica_solicitada']]['nombre']}» necesita "
+            "pasillos paralelos reconocibles; se usó vecino más cercano.")
+
+    v_ruta, v_calor = st.columns(2)
+    with v_ruta:
+        st.markdown("**Un recorrido**")
+        if det["rutas"]:
+            etiquetas = [
+                f"Pedido {r['pedido']}"
+                + (f" · viaje {r['viaje']}/{r['n_viajes']}"
+                   if r["n_viajes"] > 1 else "")
+                for r in det["rutas"]]
+            i_sel = st.selectbox("Recorrido", range(len(etiquetas)),
+                                 format_func=lambda i: etiquetas[i],
+                                 key="ruta_sel")
+            ruta = det["rutas"][i_sel]
+            st.caption(f"{len(ruta['paradas'])} paradas · "
+                       f"{ruta['dist_m']:,.0f} m · {ruta['t_min']:.1f} min"
+                       + ("  ·  camino real por pasillos" if ruta.get("poly")
+                          else "  ·  trayecto Manhattan aproximado"))
+            fig_r = viz.plano_2d(res, "familia", con_hover=False)
+            cs = ruta["coords"]
+            if ruta.get("poly"):
+                fig_r.add_trace(go.Scatter(
+                    x=[p[0] for p in cs], y=[p[1] for p in cs], mode="lines",
+                    line=dict(color="#e6472f", width=2.5), name="recorrido",
+                    hoverinfo="skip"))
+            else:
+                rx, ry = [], []
+                for a, b in zip(cs[:-1], cs[1:]):
+                    rx += [a[0], b[0], b[0], None]
+                    ry += [a[1], a[1], b[1], None]
+                fig_r.add_trace(go.Scatter(
+                    x=rx, y=ry, mode="lines",
+                    line=dict(color="#e6472f", width=2.5), name="recorrido",
+                    hoverinfo="skip"))
+            paradas = ruta.get("paradas") or cs[1:-1]
+            fig_r.add_trace(go.Scatter(
+                x=[p[0] for p in paradas], y=[p[1] for p in paradas],
+                mode="markers+text",
+                text=[str(i + 1) for i in range(len(paradas))],
+                textposition="top center",
+                textfont=dict(size=10, color="#e6472f"),
+                marker=dict(size=9, color="#e6472f"), name="paradas"))
+            fig_r.add_trace(go.Scatter(
+                x=[t[0][0] for t in frente.tramos] + [t[1][0] for t in frente.tramos],
+                y=[t[0][1] for t in frente.tramos] + [t[1][1] for t in frente.tramos],
+                mode="markers", marker=dict(size=13, color="#222",
+                                            symbol="triangle-up"),
+                name="andén"))
+            st.plotly_chart(fig_r, width="stretch")
+        else:
+            st.info("No hay recorridos que dibujar.")
+
+    with v_calor:
+        st.markdown("**Frecuencia de visita**")
+        st.caption("Las posiciones muy visitadas **lejos del andén** son las "
+                   "candidatas a moverse al frente.")
+        vis = det["visitas"]
+        fig_c = viz.plano_2d(res, "familia", con_hover=False)
+        if len(vis):
+            fig_c.add_trace(go.Scatter(
+                x=vis["x"], y=vis["y"], mode="markers",
+                marker=dict(size=4 + 18 * vis["visitas"]
+                            / max(int(vis["visitas"].max()), 1),
+                            color=vis["visitas"], colorscale="YlOrRd",
+                            showscale=True, colorbar=dict(title="visitas"),
+                            line=dict(width=0.5, color="#333")),
+                hovertext=[f"SKU {s}: {v} visitas"
+                           for s, v in zip(vis["sku"], vis["visitas"])],
+                hoverinfo="text", showlegend=False))
+        st.plotly_chart(fig_c, width="stretch")
+
+    with st.expander("📊 Distribuciones y datos"):
+        g1, g2 = st.columns(2)
+        with g1:
+            fig_h = go.Figure(go.Histogram(x=det["pedidos"]["dist_m"],
+                                           nbinsx=30, marker_color="#0a7"))
+            fig_h.update_layout(height=280, title="Distancia por pedido (m)",
+                                margin=dict(l=10, r=10, t=34, b=10))
+            st.plotly_chart(fig_h, width="stretch")
+        with g2:
+            fig_t = go.Figure(go.Histogram(x=det["pedidos"]["t_min"],
+                                           nbinsx=30, marker_color="#36c"))
+            fig_t.update_layout(height=280, title="Tiempo por pedido (min)",
+                                margin=dict(l=10, r=10, t=34, b=10))
+            st.plotly_chart(fig_t, width="stretch")
+        st.dataframe(det["pedidos"], width="stretch", hide_index=True)
+        dc1, dc2 = st.columns(2)
+        dc1.download_button(
+            "⬇️ Pedidos simulados",
+            det["pedidos"].to_csv(index=False).encode("utf-8-sig"),
+            "simulacion_pedidos.csv", "text/csv", width="stretch")
+        dc2.download_button(
+            "⬇️ Visitas por SKU",
+            det["visitas"].to_csv(index=False).encode("utf-8-sig"),
+            "simulacion_visitas.csv", "text/csv", width="stretch")
+    st.session_state["ultima_simulacion"] = {"kpis": dict(kd),
+                                             "demanda": origen_txt}
+
+
+# --------------------------------------------------------------------------- #
+# Guardar como escenario
+# --------------------------------------------------------------------------- #
+st.divider()
+with st.expander("💾 Guardar este análisis como escenario"):
+    esc_g = st.session_state.get("comparativa_puntuada")
+    nombre_esc = st.text_input("Nombre del escenario",
+                               value="Operación y métodos",
+                               key="nombre_escenario_operacion")
+    st.caption("Queda una versión inmutable con los KPIs y los artefactos, "
+               "consultable y comparable en el paso de Escenarios.")
+    if st.button("Guardar escenario", type="primary", width="stretch",
+                 key="guardar_escenario_operacion",
+                 disabled=esc_g is None or esc_g.empty):
+        def _guardar():
+            store = ScenarioStore(SCENARIO_DB)
+            zonas_df = sorted(df.get("zona_fisica", pd.Series(dtype=str))
+                              .dropna().astype(str).unique())
+            mejor = esc_g.iloc[0]
+            sid = store.save(
+                name=nombre_esc,
+                facility=st.session_state.get("cedis_codigo", "GENERAL"),
+                zone=zonas_df[0] if len(zonas_df) == 1 else "MIXTA",
+                parent_id=st.session_state.get("ultimo_escenario_id"),
+                source_file=st.session_state.get("fuente_nombre"),
+                parameters={
+                    "tipo": "operacion_y_metodos",
+                    "metodo": mejor["metodo"],
+                    "zonificacion": mejor["zonificacion"],
+                    "politica": mejor["politica"],
+                    "demanda": origen_txt,
+                    "operacion": PAR.resumen_operacion(cfg_sim),
+                    "perfil_motor": st.session_state.get(
+                        "cedis_engine_profile", "default"),
+                },
+                kpis={k: v for k, v in mejor.to_dict().items()
+                      if isinstance(v, (int, float))},
+                artifacts={
+                    "comparativa": esc_g,
+                    "ubicaciones": pd.DataFrame(res.get("slots", [])),
+                    "asignaciones": res["asignaciones"],
+                },
+            )
+            st.session_state["ultimo_escenario_id"] = sid
+
+        confirmar_accion(
+            titulo="Guardar escenario",
+            detalle=(
+                f"Se creará una versión inmutable «{nombre_esc}» para "
+                f"{st.session_state.get('cedis_codigo', 'GENERAL')} con la "
+                "comparativa completa y el layout evaluado."),
+            al_confirmar=_guardar,
+            etiqueta_confirmar="Guardar",
+            destino="pages/4_Escenarios.py",
+            clave="guardar_operacion")

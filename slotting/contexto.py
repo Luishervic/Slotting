@@ -128,6 +128,62 @@ def cargar_zona(zona: str, catalogos: dict | None = None,
     return df, meta
 
 
+def cargar_zonas(zonas: list[str], catalogos: dict | None = None,
+                 cedis: "Cedis | str | Path | None" = None
+                 ) -> tuple[pd.DataFrame, dict]:
+    """Une el maestro de VARIAS zonas físicas en un solo alcance.
+
+    Un espacio físico no siempre corresponde a una sola zona lógica: conviene
+    mezclar cuando dos zonas comparten equipo de surtido, cuando una es
+    demasiado chica para justificar su propia área, o cuando el mismo pasillo
+    puede atender a las dos sin cruzar mercancía confinada. Aquí se arma ese
+    alcance combinado conservando `zona_fisica` en cada fila, que es lo que
+    después permite reservar áreas del layout por zona de origen.
+
+    Un SKU que aparece en más de un maestro se queda con el primero según el
+    orden pedido, y la repetición se reporta: casi siempre es un error de los
+    maestros y esconderlo produciría doble conteo de unidades.
+    """
+    zonas = [str(z).strip().upper() for z in zonas if str(z).strip()]
+    if not zonas:
+        raise ValueError("No se indicó ninguna zona física.")
+    c = (catalogos or {}).get("cedis") or _resolver(cedis)
+    cat = catalogos or cargar_catalogos(c)
+
+    partes, metas, duplicados = [], {}, {}
+    vistos: set[str] = set()
+    for zona in zonas:
+        d, meta = cargar_zona(zona, cat, c)
+        d = d.copy()
+        # `zona_fisica` puede venir del enriquecimiento por surtidor; se fija a
+        # la zona del maestro para que el origen sea inequívoco al mezclar.
+        d["zona_fisica_maestro"] = zona
+        if "zona_fisica" not in d.columns or d["zona_fisica"].isna().all():
+            d["zona_fisica"] = zona
+        claves = d["sku"].astype(str)
+        repetidos = sorted(set(claves) & vistos)
+        if repetidos:
+            duplicados[zona] = repetidos
+            d = d[~claves.isin(vistos)]
+        vistos |= set(d["sku"].astype(str))
+        partes.append(d)
+        metas[zona] = meta
+
+    combinado = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+    meta = {
+        "zonas": zonas,
+        "zona_fisica": " + ".join(zonas),
+        "archivo": ", ".join(sorted({m.get("archivo", "") for m in metas.values()})),
+        "cedis": c.nombre,
+        "por_zona": {z: int((combinado["zona_fisica_maestro"] == z).sum())
+                     for z in zonas} if len(combinado) else {},
+        "skus": int(combinado["sku"].astype(str).nunique()) if len(combinado) else 0,
+        "duplicados_entre_zonas": duplicados,
+        "detalle": metas,
+    }
+    return combinado, meta
+
+
 def estructura_de(zona: str, catalogos: dict | None = None,
                   cedis: "Cedis | str | Path | None" = None
                   ) -> ST.StructureConfig:

@@ -694,14 +694,31 @@ def plano_importado(mapeado: dict, ancho_m: float, largo_m: float,
     fig = go.Figure()
 
     perimetro = mapeado.get("perimetro") or []
+    cuerpos = mapeado.get("cuerpos") or []
     if len(perimetro) > 2:
         xs = [p[0] for p in perimetro] + [perimetro[0][0]]
         ys = [p[1] for p in perimetro] + [perimetro[0][1]]
         fig.add_trace(go.Scatter(
-            x=xs, y=ys, mode="lines", fill="toself",
+            x=xs, y=ys, mode="lines",
+            fill=None if cuerpos else "toself",
             fillcolor="rgba(120,140,170,0.10)",
-            line=dict(color="#4b5b70", width=2.5), name="perímetro",
-            hoverinfo="skip"))
+            line=dict(color="#4b5b70", width=2.5,
+                      dash="dot" if cuerpos else "solid"),
+            name="envolvente" if cuerpos else "perímetro", hoverinfo="skip"))
+
+    # Con varios cuerpos, la envolvente es sólo el lienzo: lo que hay que ver
+    # dibujado es CADA nave, porque el hueco entre ellas es patio y no piso.
+    for i, cuerpo in enumerate(cuerpos):
+        if len(cuerpo) < 3:
+            continue
+        xs = [p[0] for p in cuerpo] + [cuerpo[0][0]]
+        ys = [p[1] for p in cuerpo] + [cuerpo[0][1]]
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", fill="toself",
+            fillcolor="rgba(120,140,170,0.16)",
+            line=dict(color="#4b5b70", width=2.5),
+            name="cuerpos de la nave", legendgroup="cuerpos",
+            showlegend=i == 0, hoverinfo="skip"))
 
     def _rects(items, color, borde, nombre, texto=None):
         if not items:

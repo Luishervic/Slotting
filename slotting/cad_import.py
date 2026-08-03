@@ -68,7 +68,9 @@ NOMBRE_UNIDAD = {
 # ahorrar clics, nunca una decisión: el usuario confirma en la tabla.
 _PISTAS = {
     "perimetro": ("muro", "wall", "perimetr", "contorno", "barda", "nave",
-                  "edificio", "building", "arquitectura", "a-wall", "limite"),
+                  "edificio", "building", "arquitectura", "a-wall", "limite",
+                  "planta", "crujia", "predio", "terreno", "poligono",
+                  "envolvente", "shell", "outline"),
     "obstaculo": ("columna", "column", "col", "obstacul", "pilar", "estructura",
                   "escalera", "bano", "oficina", "poste", "s-colu"),
     "zona": ("zona", "zone", "area", "sector", "region", "pickzone"),
@@ -352,8 +354,27 @@ def leer(datos: bytes, nombre: str = "plano.dxf",
         codigo = int(doc.header.get("$INSUNITS", 0) or 0)
         factor = _UNIDADES.get(codigo)
         if factor:
-            escala = factor
-            plano.unidad_origen = NOMBRE_UNIDAD.get(factor, f"código {codigo}")
+            # Lo declarado en el encabezado se cree, pero se verifica: un
+            # archivo puede decir milímetros y estar dibujado en metros, y es
+            # de lo más común. Si la unidad declarada produce una nave absurda
+            # —el caso real que motivó esto daba 0.15 × 0.07 m— gana el tamaño,
+            # porque un CEDIS mide decenas o cientos de metros y eso no admite
+            # discusión.
+            mayor = max(x1 - x0, y1 - y0) * factor
+            if 3.0 <= mayor <= 2000.0:
+                escala = factor
+                plano.unidad_origen = NOMBRE_UNIDAD.get(
+                    factor, f"código {codigo}")
+            else:
+                declarada = NOMBRE_UNIDAD.get(factor, f"código {codigo}")
+                escala, plano.unidad_origen = _escala_desde_tamano(
+                    x1 - x0, y1 - y0)
+                plano.avisos.append(
+                    f"El archivo declara **{declarada}**, pero con esa unidad "
+                    f"la nave mediría {mayor:,.3f} m, que es imposible para un "
+                    f"CEDIS. Se usaron **{plano.unidad_origen}**. Verifica la "
+                    "medida contra el plano y, si no coincide, fija las "
+                    "unidades a mano.")
         else:
             escala, plano.unidad_origen = _escala_desde_tamano(x1 - x0, y1 - y0)
             plano.avisos.append(
@@ -369,8 +390,10 @@ def leer(datos: bytes, nombre: str = "plano.dxf",
     plano.largo_m = round((y1 - y0) * escala, 3)
 
     for capa, lista in crudo.items():
-        convertidas = [[(round((x - x0) * escala, 4),
-                         round((y - y0) * escala, 4)) for x, y in pts]
+        # El cierre se evalúa YA EN METROS: la holgura admisible es una medida
+        # del mundo real (centímetros), no un número de unidades de dibujo.
+        convertidas = [_cerrar([(round((x - x0) * escala, 4),
+                                 round((y - y0) * escala, 4)) for x, y in pts])
                        for pts in lista]
         plano.poligonos[capa] = convertidas
         cerradas = [p for p in convertidas
@@ -393,10 +416,30 @@ def leer(datos: bytes, nombre: str = "plano.dxf",
     return plano
 
 
-def _cerrado(pts: list[tuple], tol: float = 1e-6) -> bool:
+# Holgura admitida para dar por cerrado un contorno, EN METROS. Nadie dibuja
+# con precisión de micrón: un muro cerrado a ojo o con el forzado de referencia
+# mal puesto deja un hueco de milímetros, y el contorno sigue siendo el
+# perímetro de la nave. Con una tolerancia exacta, ese hueco descartaba el
+# contorno entero y la importación se quedaba con el contorno secundario.
+TOL_CIERRE_M = 0.05
+
+
+def _cerrado(pts: list[tuple], tol: float = TOL_CIERRE_M) -> bool:
     return (len(pts) > 3
-            and abs(pts[0][0] - pts[-1][0]) < tol
-            and abs(pts[0][1] - pts[-1][1]) < tol)
+            and abs(pts[0][0] - pts[-1][0]) <= tol
+            and abs(pts[0][1] - pts[-1][1]) <= tol)
+
+
+def _cerrar(pts: list[tuple], tol: float = TOL_CIERRE_M) -> list[tuple]:
+    """Cierra exactamente un contorno que ya venía casi cerrado.
+
+    Se ajusta el último vértice al primero en vez de agregar uno nuevo: la
+    diferencia es de milímetros y dejarla suelta ensucia el cálculo de área y
+    las pruebas de punto-en-polígono aguas abajo.
+    """
+    if len(pts) > 3 and _cerrado(pts, tol) and pts[0] != pts[-1]:
+        return pts[:-1] + [pts[0]]
+    return pts
 
 
 def sugerir_rol(capa: str) -> str:
@@ -435,7 +478,7 @@ def mapear(plano: Plano, roles: dict[str, str],
       - Las zonas conservan el polígono completo, que sí se soporta.
     """
     salida = {"perimetro": [], "obstaculos": [], "zonas": [], "accesos": [],
-              "ubicaciones": [], "ancho_m": plano.ancho_m,
+              "ubicaciones": [], "cuerpos": [], "ancho_m": plano.ancho_m,
               "largo_m": plano.largo_m, "avisos": list(plano.avisos)}
 
     por_rol: dict[str, list] = {}
@@ -453,25 +496,44 @@ def mapear(plano: Plano, roles: dict[str, str],
     dx = dy = 0.0
     candidatos = [p for p in por_rol.get("perimetro", [])
                   if _cerrado(p) and _area(p) > area_min_m2]
+    naves: list[list[tuple]] = []
     if candidatos:
-        mejor = max(candidatos, key=_area)
-        caja = _bbox(mejor)
+        candidatos.sort(key=_area, reverse=True)
+        # Una nave puede estar partida en varios cuerpos: dos crujías, un anexo,
+        # una ampliación. Quedarse sólo con el mayor tira área operativa real, y
+        # es exactamente lo que pasaba con los planos de dos naves.
+        caja = _bbox([p for c in candidatos for p in c])
         dx, dy = caja["x"], caja["y"]
         salida["ancho_m"] = round(caja["w"], 3)
         salida["largo_m"] = round(caja["d"], 3)
-        salida["perimetro"] = [(round(x - dx, 4), round(y - dy, 4))
-                               for x, y in mejor[:-1]]
-        if len(candidatos) > 1:
+        naves = [[(round(x - dx, 4), round(y - dy, 4)) for x, y in c[:-1]]
+                 for c in candidatos]
+
+        if len(naves) == 1:
+            salida["perimetro"] = naves[0]
+        else:
+            # Con varios cuerpos, el perímetro pasa a ser la envolvente —el
+            # lienzo— y cada cuerpo se vuelve un área operativa. Si no, se
+            # podrían colocar ubicaciones en el hueco que hay ENTRE las naves,
+            # que es patio y no piso.
+            salida["perimetro"] = [
+                (0.0, 0.0), (salida["ancho_m"], 0.0),
+                (salida["ancho_m"], salida["largo_m"]),
+                (0.0, salida["largo_m"])]
+            salida["cuerpos"] = naves
             salida["avisos"].append(
-                f"La capa de perímetro traía {len(candidatos)} contornos "
-                f"cerrados; se tomó el mayor ({_area(mejor):,.0f} m²). Los "
-                "demás quedaron fuera: si alguno era parte del área operativa, "
-                "agrégalo como zona o dibújalo en el editor.")
+                f"La capa de perímetro traía {len(naves)} contornos cerrados "
+                "(" + ", ".join(f"{_area(c + [c[0]]):,.0f} m²" for c in naves)
+                + "). Se importaron todos: el contorno pasa a ser la "
+                "envolvente y cada cuerpo queda como área operativa, para que "
+                "no se acomode nada en el espacio que hay entre ellos.")
     elif "perimetro" in por_rol:
+        n_abiertos = len(por_rol["perimetro"])
         salida["avisos"].append(
-            "Ninguna polilínea de la capa de perímetro está cerrada, así que "
-            "no define un área. En AutoCAD ciérrala (comando PEDIT → Cerrar) o "
-            "dibuja el contorno en el editor.")
+            f"Las {n_abiertos} polilíneas de la capa de perímetro no cierran "
+            f"(se admite una holgura de {TOL_CIERRE_M * 100:.0f} cm) o son más "
+            "chicas que el área mínima, así que no definen un área. En AutoCAD "
+            "ciérralas con PEDIT → Cerrar, o dibuja el contorno en el editor.")
 
     # --- Obstáculos, accesos y ubicaciones ---------------------------- #
     for rol, destino, prefijo in (("obstaculo", "obstaculos", "OBS"),
@@ -510,6 +572,22 @@ def mapear(plano: Plano, roles: dict[str, str],
             "poligono": [(round(x - dx, 4), round(y - dy, 4))
                          for x, y in pts[:-1]],
         })
+
+    # Los cuerpos de la nave sólo se vuelven zonas cuando no hay una capa de
+    # zonas propia. Si el plano ya trae las áreas de trabajo dibujadas —el caso
+    # normal: «Área de Piso» dentro de «Planta»—, ésas mandan, y convertir
+    # además los cuerpos en zonas permitiría colocar fuera del área de trabajo.
+    if salida["cuerpos"]:
+        if salida["zonas"]:
+            salida["avisos"].append(
+                f"Los {len(salida['cuerpos'])} cuerpos de la nave quedan como "
+                f"contorno; las {len(salida['zonas'])} zonas importadas son las "
+                "que delimitan dónde se puede acomodar.")
+        else:
+            for i, cuerpo in enumerate(salida["cuerpos"], start=1):
+                salida["zonas"].append({
+                    "nombre": f"Nave {i}", "prioridad": i,
+                    "poligono": list(cuerpo)})
 
     for clave, etiqueta in (("obstaculos", "obstáculos"), ("accesos", "accesos"),
                             ("zonas", "zonas"), ("ubicaciones", "ubicaciones")):

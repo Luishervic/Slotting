@@ -264,7 +264,7 @@ with st.sidebar:
     # realiza en el CAD para no duplicar flujos.
     largo = float(st.session_state["largo_m"])
     ancho = float(st.session_state["ancho_m"])
-    with st.expander("Respaldo tabular del perímetro (avanzado)", expanded=False):
+    with st.expander("Editar el contorno como tabla (avanzado)", expanded=False):
         st.caption(
             "El rectángulo sigue siendo el lienzo de coordenadas. Si la bodega "
             "tiene entrantes, diagonales o zonas que no existen, captura los "
@@ -294,7 +294,7 @@ with st.sidebar:
                 st.session_state["perimetro"] = candidato
                 st.session_state["perimetro_rev"] += 1
                 st.rerun()
-    with st.expander("Respaldo tabular de zonas (avanzado)", expanded=False):
+    with st.expander("Editar las zonas como tabla (avanzado)", expanded=False):
         st.caption(
             "El CAD es la fuente principal para zonas rectangulares. Este respaldo "
             "sirve para recuperar o capturar zonas poligonales. Para un "
@@ -429,9 +429,9 @@ st.session_state["meta_escenario"] = {
     "factor": float(factor_escenario),
 }
 
-st.subheader("1. Plano operativo")
-st.caption("Captura dimensiones, modifica el contorno con vértices y dibuja zonas, "
-           "obstáculos, entradas o salidas. Guarda el borrador CAD y después aplícalo.")
+st.subheader("1 · El plano")
+st.caption("Importa el plano de arquitectura o dibuja el contorno a mano. "
+           "De aquí salen el área operativa, las zonas, las columnas y el andén.")
 
 # --------------------------------------------------------------------------- #
 # Importar el plano de arquitectura
@@ -516,11 +516,19 @@ with st.expander("📐 Importar plano CAD (DWG o DXF)", expanded=False):
                 st.markdown(f"**{rol}** — {CAD.ROL_DESCRIPCION[rol]}")
 
         previo = CAD.mapear(plano, roles)
-        v1, v2, v3, v4 = st.columns(4)
-        v1.metric("Perímetro", f"{len(previo['perimetro'])} vértices")
-        v2.metric("Obstáculos", f"{len(previo['obstaculos'])}")
-        v3.metric("Zonas", f"{len(previo['zonas'])}")
-        v4.metric("Accesos", f"{len(previo['accesos'])}")
+        v1, v2, v3, v4, v5 = st.columns(5)
+        v1.metric("Área operativa",
+                  f"{previo['ancho_m']:,.1f} × {previo['largo_m']:,.1f} m")
+        v2.metric("Cuerpos de la nave",
+                  f"{len(previo['cuerpos']) or (1 if previo['perimetro'] else 0)}",
+                  help="Una nave puede venir partida en varias crujías o "
+                       "anexos. Se importan todos.")
+        v3.metric("Obstáculos", f"{len(previo['obstaculos'])}")
+        v4.metric("Zonas", f"{len(previo['zonas'])}")
+        v5.metric("Accesos", f"{len(previo['accesos'])}")
+        for aviso in previo["avisos"]:
+            if "contornos cerrados" in aviso or "cuerpos" in aviso:
+                st.info(aviso)
 
         fig_cad = viz.plano_importado(previo, plano.ancho_m, plano.largo_m)
         st.plotly_chart(fig_cad, width="stretch")
@@ -534,6 +542,14 @@ with st.expander("📐 Importar plano CAD (DWG o DXF)", expanded=False):
         if st.button("📥 Aplicar el plano al layout", type="primary",
                      width="stretch",
                      disabled=not previo["perimetro"]):
+            gen_ubic = st.checkbox(
+                "Generar las ubicaciones dentro del plano al aplicarlo",
+                value=not previo["ubicaciones"], key="cad_generar_ubicaciones",
+                help="Acomoda los SKU dentro del contorno y las zonas "
+                     "importadas, para pasar directo a revisar el layout. "
+                     "Puedes recalcularlo después con otros tipos de "
+                     "ubicación.")
+
             def _aplicar_plano():
                 st.session_state["perimetro"] = previo["perimetro"]
                 st.session_state["obstaculos"] = previo["obstaculos"]
@@ -546,15 +562,26 @@ with st.expander("📐 Importar plano CAD (DWG o DXF)", expanded=False):
                 for clave in ("perimetro_rev", "obs_rev", "zonas_layout_rev",
                               "slots_rev"):
                     st.session_state[clave] = st.session_state.get(clave, 0) + 1
+                # Al descartar el borrador y subir `perimetro_rev`, los campos
+                # de dimensión del editor se re-crean con las medidas del plano
+                # importado en vez de conservar las anteriores.
                 st.session_state.pop("cad_borrador", None)
                 st.session_state.pop("cad_dimensiones_borrador", None)
+                # La propuesta de ubicaciones necesita `cfg` y el catálogo
+                # filtrado, que se construyen más abajo en la página. Se deja
+                # la orden marcada y se ejecuta allá, en vez de duplicar aquí
+                # el armado de la configuración.
+                st.session_state["importar_generar_ubicaciones"] = bool(
+                    st.session_state.get("cad_generar_ubicaciones", False))
 
             confirmar_accion(
                 titulo="Aplicar el plano importado",
                 detalle=(
                     f"Se reemplazará el área ({previo['ancho_m']:.1f} × "
-                    f"{previo['largo_m']:.1f} m), su contorno, "
-                    f"{len(previo['obstaculos'])} obstáculos, "
+                    f"{previo['largo_m']:.1f} m), su contorno"
+                    + (f" ({len(previo['cuerpos'])} cuerpos)"
+                       if previo["cuerpos"] else "")
+                    + f", {len(previo['obstaculos'])} obstáculos, "
                     f"{len(previo['zonas'])} zonas y "
                     f"{len(previo['accesos'])} accesos"
                     + (f", además de {len(previo['ubicaciones'])} ubicaciones"
@@ -580,18 +607,24 @@ with st.expander("✏️ Editor CAD del área y ubicaciones", expanded=True):
         "rejilla": float(st.session_state["cad_rejilla"]),
     })
     cd1, cd2, cd3 = st.columns(3)
+    # Estos campos llevan `key`, así que su valor vive en session_state y GANA
+    # sobre el `value=` con el que se construyen: al importar un plano nuevo el
+    # contorno cambiaba y las medidas se quedaban en las anteriores. Se les
+    # cuelga la revisión del perímetro, que es el mismo recurso que usa el resto
+    # de la página para re-sembrar un widget cuando su fuente cambió.
+    _rev_cad = st.session_state["perimetro_rev"]
     ancho_cad = cd1.number_input("Ancho del plano (m)", min_value=5.0,
-                                 max_value=500.0, step=1.0,
+                                 max_value=2000.0, step=1.0,
                                  value=float(dimensiones_cad["ancho"]),
-                                 key="cad_ancho_borrador")
+                                 key=f"cad_ancho_borrador_{_rev_cad}")
     largo_cad = cd2.number_input("Largo del plano (m)", min_value=5.0,
-                                 max_value=500.0, step=1.0,
+                                 max_value=2000.0, step=1.0,
                                  value=float(dimensiones_cad["largo"]),
-                                 key="cad_largo_borrador")
+                                 key=f"cad_largo_borrador_{_rev_cad}")
     rejilla_cad = cd3.select_slider("Rejilla CAD (m)",
                                     options=[0.10, 0.25, 0.50, 1.00],
                                     value=float(dimensiones_cad["rejilla"]),
-                                    key="cad_rejilla_borrador")
+                                    key=f"cad_rejilla_borrador_{_rev_cad}")
     st.session_state["cad_dimensiones_borrador"] = {
         "ancho": float(ancho_cad), "largo": float(largo_cad),
         "rejilla": float(rejilla_cad),
@@ -678,9 +711,6 @@ with st.expander("✏️ Editor CAD del área y ubicaciones", expanded=True):
             st.session_state["largo_m"] = dim["largo"]
             st.session_state["cad_rejilla"] = dim["rejilla"]
             st.session_state.pop("cad_dimensiones_borrador", None)
-            st.session_state.pop("cad_ancho_borrador", None)
-            st.session_state.pop("cad_largo_borrador", None)
-            st.session_state.pop("cad_rejilla_borrador", None)
             st.session_state["perimetro_rev"] += 1
             st.session_state["obs_rev"] += 1
             st.session_state["zonas_layout_rev"] += 1
@@ -690,9 +720,6 @@ with st.expander("✏️ Editor CAD del área y ubicaciones", expanded=True):
     if ca2.button("↩️ Descartar plano CAD", width='stretch'):
         st.session_state.pop("cad_borrador", None)
         st.session_state.pop("cad_dimensiones_borrador", None)
-        st.session_state.pop("cad_ancho_borrador", None)
-        st.session_state.pop("cad_largo_borrador", None)
-        st.session_state.pop("cad_rejilla_borrador", None)
         st.session_state["perimetro_rev"] += 1
         st.rerun()
 
@@ -721,10 +748,56 @@ _max_ubic = {s: max(1, int(umbral_rep) - 1) for s in _sobrestock}
 st.session_state["max_ubic_sobrestock"] = _max_ubic
 
 # --------------------------------------------------------------------------- #
-# 2) Ajuste manual opcional de tipos. La propuesta automática vive en el bloque
-# de Alternativas y es la única fuente automática de layouts.
+# Continuidad tras importar un plano
 # --------------------------------------------------------------------------- #
-with st.expander("⚙️ Ajuste manual de tipos (opcional)", expanded=False):
+# Importar el plano deja el contorno, las zonas y los obstáculos, pero sin
+# ubicaciones no hay nada que simular y el flujo se interrumpe justo después de
+# la parte que costó trabajo. Aquí se acomoda dentro de lo importado para que el
+# siguiente paso esté disponible de inmediato; el usuario puede recalcularlo
+# después con otros tipos de ubicación.
+if st.session_state.pop("importar_generar_ubicaciones", False):
+    if df_viable.empty:
+        st.warning(
+            "El plano se importó, pero ningún SKU del alcance tiene "
+            "dimensiones y unidades utilizables, así que no se pudieron "
+            "generar ubicaciones. Revisa **Datos y alcance** y vuelve a "
+            "generarlas con **Calcular dimensiones óptimas**.")
+    else:
+        tipos_auto = S.calcular_tipos_optimos(
+            df_viable, n_tipos=int(st.session_state.get("n_tipos", 4)))
+        st.session_state["tipos_catalogo"] = tipos_auto
+        st.session_state["tipos_rev"] = st.session_state.get("tipos_rev", 0) + 1
+        prop_auto = S.proponer_layout(
+            df_viable, cfg, pasillo_m=pasillo, tipos=tipos_auto,
+            umbral_multisku=int(umbral_viable), max_ubic=_max_ubic,
+            obstaculos=st.session_state["obstaculos"],
+            orientacion_pasillo=orientacion)
+        st.session_state["slots"] = prop_auto["slots"]
+        st.session_state["prop_resumen"] = prop_auto["resumen"]
+        st.session_state["slots_rev"] += 1
+        _precargar_grid(prop_auto["slots"], orientacion, _catalogo())
+        meta_auto = prop_auto["meta"]
+        if prop_auto["slots"]:
+            st.success(
+                f"Plano importado y acomodado: **{meta_auto['total']} "
+                f"ubicaciones** en {meta_auto['n_tipos']} tipo(s) dentro del "
+                "contorno y las zonas del plano."
+                + (f" {meta_auto['sin_espacio']} no cupieron."
+                   if meta_auto["sin_espacio"] else "")
+                + " Ya puedes revisar el layout abajo y pasar a simular.")
+        else:
+            st.warning(
+                "El plano se importó pero no cupo ninguna ubicación dentro de "
+                "sus zonas operativas. Suele significar que las zonas son más "
+                "chicas que el tipo de ubicación calculado: revisa el mapeo de "
+                "capas, o baja el nº de tipos y el ancho de pasillo.")
+
+# --------------------------------------------------------------------------- #
+# Ajuste manual opcional de tipos. La propuesta automática vive en el bloque de
+# Alternativas y es la única fuente automática de layouts; esto es para afinar.
+# --------------------------------------------------------------------------- #
+with st.expander("🛠️ Avanzado · Ajustar a mano los tipos de ubicación",
+                 expanded=False):
     st.caption(
         "El sistema propone **tipos de ubicación**, cada uno con el tamaño "
         "que cubre el P95 de frente y fondo de un grupo de piezas comparable "
@@ -798,7 +871,180 @@ with st.expander("⚙️ Ajuste manual de tipos (opcional)", expanded=False):
         st.dataframe(st.session_state["prop_resumen"], width='stretch',
                      hide_index=True)
 
-with st.expander("✨ Alternativas automáticas", expanded=not st.session_state["slots"]):
+st.subheader("2 · Las ubicaciones")
+st.caption("El sistema propone dónde va cada cosa. Es el camino normal: "
+           "genera, revisa el resultado abajo y ajusta sólo si hace falta.")
+
+# --------------------------------------------------------------------------- #
+# Reglas por zona: cada área del layout puede tener su propio ancho de pasillo,
+# su orientación y la mercancía que admite. Va ANTES de la generación porque el
+# espacio y sus reglas se definen primero; la propuesta se apoya en ellas.
+# --------------------------------------------------------------------------- #
+ZONA_REGLA_COLS = ["zona", "prioridad", "pasillo_m", "orientacion",
+                   "margen_m", "zonas_fisicas", "familias", "tipos"]
+
+
+def _reglas_zona_seed(zonas, guardadas, pasillo_def, orientacion_def):
+    """Tabla de reglas, sembrada con lo ya definido y el resto heredando."""
+    filas = []
+    for i, z in enumerate(zonas):
+        nombre = str(z.get("nombre") or f"Zona {i + 1}")
+        r = dict(guardadas.get(nombre, {}))
+        filas.append({
+            "zona": nombre,
+            "prioridad": int(z.get("prioridad") or i + 1),
+            "pasillo_m": (float(r["pasillo_m"])
+                          if r.get("pasillo_m") is not None else pasillo_def),
+            "orientacion": str(r.get("orientacion") or orientacion_def),
+            "margen_m": (float(r["margen_m"])
+                         if r.get("margen_m") is not None else 0.5),
+            "zonas_fisicas": ", ".join(r.get("zonas_fisicas") or []),
+            "familias": ", ".join(r.get("familias") or []),
+            "tipos": ", ".join(r.get("tipos") or []),
+        })
+    return pd.DataFrame(filas).reindex(columns=ZONA_REGLA_COLS)
+
+
+def _reglas_zona_desde_tabla(edit):
+    """Convierte la tabla editada al diccionario que consume el motor."""
+    out = {}
+    for _, r in edit.iterrows():
+        nombre = str(r.get("zona") or "").strip()
+        if not nombre:
+            continue
+        regla = {}
+        for campo in ("pasillo_m", "margen_m"):
+            if pd.notna(r.get(campo)):
+                regla[campo] = float(r[campo])
+        if str(r.get("orientacion") or "").strip():
+            regla["orientacion"] = str(r["orientacion"]).strip()
+        for campo in ("zonas_fisicas", "familias", "tipos"):
+            texto = str(r.get(campo) or "").strip()
+            if texto and texto.lower() not in ("nan", "none"):
+                regla[campo] = [p.strip() for p in texto.replace(";", ",").split(",")
+                                if p.strip()]
+        out[nombre] = regla
+    return out
+
+
+st.session_state.setdefault("reglas_zona", {})
+_zonas_layout = st.session_state["zonas_layout"]
+
+with st.expander(
+        "🧩 Reglas por zona — pasillo, orientación y qué mercancía admite",
+        expanded=bool(_zonas_layout) and not st.session_state["slots"]):
+    if not _zonas_layout:
+        st.info(
+            "Todavía no hay zonas. Dibújalas en el editor CAD de arriba o "
+            "impórtalas del plano, y aquí podrás darle a cada una su propio "
+            "ancho de pasillo, su orientación y la mercancía que admite. "
+            "Sin zonas, la generación usa los valores generales para toda "
+            "la nave.")
+    else:
+        st.caption(
+            "Cada zona se resuelve por separado, dentro de su propio "
+            "rectángulo. Un área de piso a granel puede ir **sin pasillo** "
+            "(0 m) y sin margen; una franja alta y angosta rinde más con "
+            "orientación **vertical**. Deja un campo vacío para heredar el "
+            "valor general de la barra lateral.")
+        _zf_disponibles = sorted(
+            df.get("zona_fisica", pd.Series(dtype=str))
+            .dropna().astype(str).str.upper().unique()) if len(df) else []
+        if len(_zf_disponibles) > 1:
+            st.caption(
+                "Tu alcance mezcla **" + " · ".join(_zf_disponibles)
+                + "**. Escribe una o varias en «zonas físicas» para reservar "
+                "esa área a esa mercancía; vacío = admite cualquiera.")
+
+        _seed = _reglas_zona_seed(_zonas_layout,
+                                  st.session_state["reglas_zona"],
+                                  float(pasillo), orientacion)
+        _edit = st.data_editor(
+            _seed, width="stretch", hide_index=True, num_rows="fixed",
+            key=f"reglas_zona_editor_{st.session_state['zonas_layout_rev']}",
+            column_config={
+                "zona": st.column_config.TextColumn("Zona", disabled=True),
+                "prioridad": st.column_config.NumberColumn(
+                    "Prioridad", min_value=1, step=1,
+                    help="Orden en que se resuelven. La mercancía que ya cabe "
+                         "en una zona no vuelve a pedir espacio en la "
+                         "siguiente."),
+                "pasillo_m": st.column_config.NumberColumn(
+                    "Pasillo (m)", min_value=0.0, max_value=10.0, step=0.1,
+                    format="%.2f",
+                    help="0 = sin pasillo; las hileras quedan pegadas."),
+                "orientacion": st.column_config.SelectboxColumn(
+                    "Orientación", options=["horizontal", "vertical"]),
+                "margen_m": st.column_config.NumberColumn(
+                    "Margen (m)", min_value=0.0, max_value=5.0, step=0.1,
+                    format="%.2f",
+                    help="Holgura contra el borde de la zona."),
+                "zonas_fisicas": st.column_config.TextColumn(
+                    "Zonas físicas que admite",
+                    help="Separadas por coma. Vacío = cualquiera."),
+                "familias": st.column_config.TextColumn(
+                    "Familias que admite", help="Separadas por coma."),
+                "tipos": st.column_config.TextColumn(
+                    "Tipos de ubicación", help="Códigos separados por coma."),
+            })
+        st.session_state["reglas_zona"] = _reglas_zona_desde_tabla(_edit)
+
+        _prioridades = {str(r["zona"]): int(r["prioridad"])
+                        for _, r in _edit.iterrows() if pd.notna(r["prioridad"])}
+        if _prioridades:
+            for z in st.session_state["zonas_layout"]:
+                if z.get("nombre") in _prioridades:
+                    z["prioridad"] = _prioridades[z["nombre"]]
+
+        if st.button("🧩 Generar ubicaciones zona por zona", type="primary",
+                     width="stretch"):
+            if df_viable.empty:
+                st.error("No hay SKU con dimensiones y unidades utilizables.")
+            else:
+                _tipos = [t for t in st.session_state.get("tipos_catalogo", [])
+                          if t.get("w") and t.get("d")]
+                if not _tipos:
+                    _tipos = S.calcular_tipos_optimos(
+                        df_viable, n_tipos=int(st.session_state.get("n_tipos", 4)))
+                    st.session_state["tipos_catalogo"] = _tipos
+                    st.session_state["tipos_rev"] = st.session_state.get(
+                        "tipos_rev", 0) + 1
+                try:
+                    with st.spinner("Generando zona por zona…"):
+                        _pz = S.proponer_por_zonas(
+                            df_viable, cfg, tipos=_tipos,
+                            pasillo_m=float(pasillo),
+                            orientacion_pasillo=orientacion,
+                            umbral_multisku=int(umbral_viable),
+                            max_ubic=_max_ubic,
+                            obstaculos=st.session_state["obstaculos"],
+                            reglas=st.session_state["reglas_zona"])
+                except ValueError as exc:
+                    st.error(str(exc))
+                    _pz = None
+                if _pz is not None:
+                    st.session_state["slots"] = _pz["slots"]
+                    st.session_state["prop_resumen"] = _pz["resumen"]
+                    st.session_state["reparto_zonas"] = _pz["por_zona"]
+                    st.session_state["slots_rev"] += 1
+                    _precargar_grid(_pz["slots"], orientacion, _catalogo())
+                    st.rerun()
+
+    _reparto = st.session_state.get("reparto_zonas")
+    if _reparto is not None and len(_reparto):
+        st.markdown("**Qué se generó en cada zona**")
+        st.dataframe(_reparto, width="stretch", hide_index=True)
+        _vacias = _reparto[_reparto["ubicaciones"] == 0]
+        if len(_vacias):
+            st.warning(
+                "Zonas sin ubicaciones: "
+                + ", ".join(f"{r['zona']} ({r['motivo'] or 'sin espacio'})"
+                            for _, r in _vacias.iterrows())
+                + ". Revisa sus reglas: un filtro de mercancía muy estrecho o "
+                "un pasillo ancho en una zona angosta la dejan vacía.")
+
+with st.expander("✨ Generar ubicaciones automáticamente",
+                 expanded=not st.session_state["slots"]):
     st.caption(
         "Genera alternativas con diferente número de tipos y orientación. El "
         "orden de decisión es: cumplir cobertura, usar menos m² y después "
@@ -918,7 +1164,8 @@ ultima_sim = st.session_state.get("ultima_simulacion", {})
 surtido_actual = (ultima_sim.get("kpis") if ultima_sim.get("firma") == firma_actual
                   else None)
 
-with st.expander("🎯 Objetivo y versiones", expanded=False):
+with st.expander("🛠️ Avanzado · Objetivo de cobertura y versiones guardadas",
+                 expanded=False):
     st.caption(
         "La decisión se evalúa en este orden: **1) cobertura mínima**, "
         "**2) menos m² de ubicaciones**, **3) menor distancia de surtido**. "
@@ -1079,8 +1326,11 @@ if st.session_state.get("move_msg"):
     st.session_state["move_msg"] = None
 
 # --------------------------------------------------------------------------- #
-# 2) Flujo: 2D -> 3D -> asignaciones -> datos
+# 3) El resultado: 2D -> 3D -> asignaciones -> datos
 # --------------------------------------------------------------------------- #
+st.subheader("3 · El resultado")
+st.caption("Cómo quedó el acomodo. Si convence, ya puedes pasar a simular la "
+           "operación; si no, vuelve a generar arriba con otros parámetros.")
 t2d, t3d, tasig, tdat = st.tabs(
     ["🗺️ 2D — editar", "🧊 3D", "🔗 Asignaciones", "📋 Datos"])
 
@@ -1505,7 +1755,7 @@ if not slots_list:
 # 3) Zona especial: SKUs de baja rotación (< mínimo de unidades)
 # --------------------------------------------------------------------------- #
 st.divider()
-st.subheader("🗃️ Zona especial — SKUs de baja rotación")
+st.subheader("🛠️ Avanzado · Zona especial para SKUs de baja rotación")
 n_esp = int(df_especial["sku"].nunique()) if not df_especial.empty else 0
 st.caption(
     f"SKUs con **menos de {int(umbral_viable)} unidades** más el "
@@ -1673,7 +1923,7 @@ else:
         st.dataframe(res_esp["overflow"], width='stretch', hide_index=True)
 
 st.divider()
-with st.expander("Guardar escenario de layout", expanded=False):
+with st.expander("💾 Guardar el layout como escenario", expanded=False):
     scenario_name = st.text_input(
         "Nombre de la versión",
         value="Layout propuesto",

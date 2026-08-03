@@ -176,6 +176,90 @@ class TestImportacionCAD(unittest.TestCase):
         self.assertAlmostEqual(max(xs) - min(xs), 60.0, places=1)
         self.assertTrue(any("contornos cerrados" in a for a in m["avisos"]))
 
+    def test_un_contorno_casi_cerrado_cuenta_como_cerrado(self):
+        """Nadie dibuja con precisión de micrón.
+
+        Caso real: el contorno de la nave grande cerraba con 3 mm de holgura en
+        un plano de 148 m —deriva normal de dibujo— y se descartaba entero, con
+        lo que la importación se quedaba con el contorno secundario.
+        """
+        doc = ezdxf.new("R2013", setup=True)
+        doc.header["$INSUNITS"] = 6                 # metros
+        doc.layers.add("MUROS")
+        msp = doc.modelspace()
+        # Último vértice a 3 mm del primero, y SIN la bandera de cerrado.
+        msp.add_lwpolyline(
+            [(0, 0), (80, 0), (80, 60), (0, 60), (0.003, 0.0002)],
+            close=False, dxfattribs={"layer": "MUROS"})
+        ruta = os.path.join(tempfile.mkdtemp(), "casi.dxf")
+        doc.saveas(ruta)
+        with open(ruta, "rb") as fh:
+            plano = CAD.leer(fh.read(), "casi.dxf")
+        self.assertEqual(plano.capas["MUROS"].cerradas, 1)
+        m = CAD.mapear(plano, {"MUROS": "perimetro"})
+        self.assertAlmostEqual(m["ancho_m"], 80.0, places=1)
+        self.assertAlmostEqual(m["largo_m"], 60.0, places=1)
+
+    def test_una_unidad_declarada_imposible_se_corrige(self):
+        """Caso real: el archivo declaraba milímetros y estaba dibujado en
+        metros, así que la nave salía de 15 cm y todo se filtraba por área."""
+        datos = _plano_de_prueba(unidades=4, escala=1.0)   # dice mm, va en m
+        plano = CAD.leer(datos, "unidad_mentirosa.dxf")
+        self.assertAlmostEqual(plano.ancho_m, 60.0, places=1)
+        self.assertTrue(any("imposible para un CEDIS" in a
+                            for a in plano.avisos))
+
+    def test_una_nave_de_varios_cuerpos_se_importa_completa(self):
+        """Quedarse con el contorno mayor tiraba media nave."""
+        doc = ezdxf.new("R2013", setup=True)
+        doc.header["$INSUNITS"] = 6
+        doc.layers.add("PLANTA")
+        msp = doc.modelspace()
+        msp.add_lwpolyline([(0, 0), (80, 0), (80, 60), (0, 60)], close=True,
+                           dxfattribs={"layer": "PLANTA"})
+        msp.add_lwpolyline([(100, 0), (130, 0), (130, 60), (100, 60)],
+                           close=True, dxfattribs={"layer": "PLANTA"})
+        ruta = os.path.join(tempfile.mkdtemp(), "dos.dxf")
+        doc.saveas(ruta)
+        with open(ruta, "rb") as fh:
+            plano = CAD.leer(fh.read(), "dos.dxf")
+        m = CAD.mapear(plano, {"PLANTA": "perimetro"})
+        self.assertEqual(len(m["cuerpos"]), 2)
+        # La envolvente cubre los dos cuerpos, no sólo el mayor.
+        self.assertAlmostEqual(m["ancho_m"], 130.0, places=1)
+        # Sin capa de zonas, cada cuerpo se vuelve área operativa para que no
+        # se acomode nada en el patio que hay entre las naves.
+        self.assertEqual(len(m["zonas"]), 2)
+        self.assertTrue(any("contornos cerrados" in a for a in m["avisos"]))
+
+    def test_con_capa_de_zonas_los_cuerpos_no_se_vuelven_zonas(self):
+        """Si el plano ya trae las áreas de trabajo, ésas mandan: convertir
+        además los cuerpos permitiría acomodar fuera del área de trabajo."""
+        doc = ezdxf.new("R2013", setup=True)
+        doc.header["$INSUNITS"] = 6
+        for capa in ("PLANTA", "AREA DE PISO"):
+            doc.layers.add(capa)
+        msp = doc.modelspace()
+        msp.add_lwpolyline([(0, 0), (80, 0), (80, 60), (0, 60)], close=True,
+                           dxfattribs={"layer": "PLANTA"})
+        msp.add_lwpolyline([(100, 0), (130, 0), (130, 60), (100, 60)],
+                           close=True, dxfattribs={"layer": "PLANTA"})
+        msp.add_lwpolyline([(5, 5), (40, 5), (40, 30), (5, 30)], close=True,
+                           dxfattribs={"layer": "AREA DE PISO"})
+        ruta = os.path.join(tempfile.mkdtemp(), "mixto.dxf")
+        doc.saveas(ruta)
+        with open(ruta, "rb") as fh:
+            plano = CAD.leer(fh.read(), "mixto.dxf")
+        m = CAD.mapear(plano, {"PLANTA": "perimetro",
+                               "AREA DE PISO": "zona"})
+        self.assertEqual(len(m["cuerpos"]), 2)
+        self.assertEqual(len(m["zonas"]), 1)
+        self.assertEqual(m["zonas"][0]["nombre"], "Zona 1")
+
+    def test_la_capa_planta_se_reconoce_como_perimetro(self):
+        self.assertEqual(CAD.sugerir_rol("Planta Desarrollador"), "perimetro")
+        self.assertEqual(CAD.sugerir_rol("Area de Piso"), "zona")
+
     def test_un_archivo_ilegible_da_error_util(self):
         with self.assertRaises(CAD.ErrorPlano):
             CAD.leer(b"esto no es un plano", "roto.dxf")
@@ -185,6 +269,58 @@ class TestImportacionCAD(unittest.TestCase):
         self.assertIn("dxf", s)
         self.assertIn("dwg", s)
         self.assertTrue(s["detalle"])
+
+    def test_lo_importado_alimenta_directamente_el_motor_de_layout(self):
+        """El plano importado tiene que servir para acomodar tal cual.
+
+        Es la continuidad del flujo: si el contorno y las zonas que salen de la
+        importación no son consumibles por `proponer_layout`, el usuario se
+        queda con un dibujo bonito y sin nada que simular.
+        """
+        roles = {c: cap.rol for c, cap in self.plano.capas.items()}
+        m = CAD.mapear(self.plano, roles)
+        catalogo = pd.DataFrame({
+            "sku": [str(2000 + i) for i in range(24)],
+            "familia": [f"F{i % 3}" for i in range(24)],
+            "clase_comercial": [f"C{i % 2}" for i in range(24)],
+            "clase_abc": ["A" if i < 6 else "B" for i in range(24)],
+            "unidades": [18] * 24,
+            "largo_cm": [60] * 24, "ancho_cm": [50] * 24, "alto_cm": [70] * 24,
+            "peso_kg": [25] * 24, "max_estiba": [3] * 24,
+        })
+        cfg = S.SlotConfig(
+            ancho_m=m["ancho_m"], largo_m=m["largo_m"],
+            perimetro=m["perimetro"],
+            zonas=[dict(z) for z in m["zonas"]])
+        prop = S.proponer_layout(catalogo, cfg, pasillo_m=3.0,
+                                 w_loc=1.4, d_loc=1.2,
+                                 obstaculos=m["obstaculos"])
+        self.assertTrue(prop["slots"], "el plano importado no admitió ninguna "
+                                       "ubicación")
+        res = S.distribuir(catalogo, prop["slots"], cfg)
+        self.assertFalse(res["asignaciones"].empty)
+
+    def test_las_ubicaciones_generadas_caen_dentro_del_plano(self):
+        """Acomodar fuera del contorno importado dejaría ubicaciones que la
+        simulación después descarta, sin que nadie entienda por qué."""
+        from slotting.geometry import rectangulo_en_poligono
+        roles = {c: cap.rol for c, cap in self.plano.capas.items()}
+        m = CAD.mapear(self.plano, roles)
+        catalogo = pd.DataFrame({
+            "sku": [str(3000 + i) for i in range(12)],
+            "familia": ["F0"] * 12, "clase_comercial": ["C0"] * 12,
+            "clase_abc": ["A"] * 12, "unidades": [15] * 12,
+            "largo_cm": [60] * 12, "ancho_cm": [50] * 12, "alto_cm": [70] * 12,
+            "peso_kg": [25] * 12, "max_estiba": [3] * 12,
+        })
+        cfg = S.SlotConfig(ancho_m=m["ancho_m"], largo_m=m["largo_m"],
+                           perimetro=m["perimetro"],
+                           zonas=[dict(z) for z in m["zonas"]])
+        prop = S.proponer_layout(catalogo, cfg, pasillo_m=3.0,
+                                 w_loc=1.4, d_loc=1.2)
+        for s in prop["slots"]:
+            self.assertTrue(rectangulo_en_poligono(s, cfg.perimetro))
+            self.assertTrue(S.rectangulo_en_zonas(s, cfg.zonas))
 
 
 # --------------------------------------------------------------------------- #

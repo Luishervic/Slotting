@@ -51,7 +51,7 @@ with continuar:
 with resumen:
     st.metric(
         "Avance del flujo",
-        f"{sum(estado.values())} de 5 etapas ejecutadas",
+        f"{sum(estado.values())} de 4 etapas ejecutadas",
     )
     st.metric("Escenarios guardados", f"{len(escenarios):,}")
 
@@ -86,42 +86,29 @@ tarjetas.extend([
     {
         "col": fila_2[0],
         "kicker": "Paso 3",
-        "title": "Simular operación",
-        "copy": "Mide recorridos, productividad y capacidad del turno.",
+        "title": "Operación y métodos",
+        "copy": "Simula el surtido, compara métodos y anima los mejores.",
         "destino": "pages/3_Operacion.py",
-        "estado": "Completado" if estado["simulacion"] else (
+        "estado": "Completado" if estado["operacion"] else (
             "Disponible" if estado["diseno"] else "Requiere paso 2"
         ),
-        "done": estado["simulacion"],
+        "done": estado["operacion"],
         "disabled": not estado["diseno"],
     },
     {
         "col": fila_2[1],
         "kicker": "Paso 4",
-        "title": "Métodos de surtido",
-        "copy": "Compara discreto, lotes y zonas; anima los tres mejores.",
-        "destino": "pages/4_Comparativa.py",
-        "estado": "Completado" if estado["comparativa"] else (
-            "Disponible" if estado["diseno"] else "Requiere paso 2"
+        "title": "Escenarios",
+        "copy": "Consulta versiones guardadas y compara sus resultados.",
+        "destino": "pages/4_Escenarios.py",
+        "estado": (
+            f"{len(escenarios):,} guardados"
+            if len(escenarios) else "Sin escenarios"
         ),
-        "done": estado["comparativa"],
-        "disabled": not estado["diseno"],
+        "done": bool(len(escenarios)) or estado["escenarios"],
+        "disabled": False,
     },
 ])
-fila_3 = st.columns(2)
-tarjetas.append({
-    "col": fila_3[0],
-    "kicker": "Paso 5",
-    "title": "Escenarios",
-    "copy": "Consulta versiones guardadas y compara sus resultados.",
-    "destino": "pages/5_Escenarios.py",
-    "estado": (
-        f"{len(escenarios):,} guardados"
-        if len(escenarios) else "Sin escenarios"
-    ),
-    "done": bool(len(escenarios)) or estado["escenarios"],
-    "disabled": False,
-})
 
 for tarjeta in tarjetas:
     with tarjeta["col"]:

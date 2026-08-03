@@ -64,13 +64,19 @@ Flujo de usuario:
 
 1. **Inicio:** muestra el avance y lleva automáticamente al siguiente paso.
 2. **Datos y alcance:** elegir zona física, validar y confirmar los SKU.
-3. **Diseñar layout:** configurar estructura y área, generar alternativas,
-   confirmar el acomodo y guardar una versión.
-4. **Simular operación:** evaluar recorridos, productividad, niveles y equipos.
-5. **Métodos de surtido:** comparar cómo organizar el trabajo sobre ese mismo
-   layout —discreto, lotes, cluster, zonas, oleadas— y animar los mejores.
-6. **Escenarios:** consultar versiones inmutables, comparar KPIs y descargar
+3. **Diseñar layout:** importar el plano CAD o dibujarlo, generar las
+   ubicaciones y revisar el acomodo en 2D y 3D.
+4. **Operación y métodos:** simular el surtido sobre ese layout, comparar
+   métodos —discreto, lotes, cluster, zonas, oleadas—, animar los mejores y
+   medir la interferencia entre operadores.
+5. **Escenarios:** consultar versiones inmutables, comparar KPIs y descargar
    sus artefactos.
+
+Simular y comparar viven en **una sola página**: son la misma pregunta con
+distinto alcance, y separarlas obligaba a capturar dos veces la velocidad, los
+tiempos, la cuadrilla y el andén —con el riesgo de dejarlas en desacuerdo y
+obtener cifras que se contradicen. Esos parámetros se declaran una sola vez en
+`slotting/parametros.py` y los comparte toda la aplicación.
 
 Las escrituras de maestros, reemplazos de layout, confirmación de alcance y
 guardado de escenarios muestran un diálogo con el impacto antes de ejecutarse.
@@ -99,12 +105,25 @@ propone un rol por el nombre de la capa (muro → perímetro, columna → obstá
 andén → acceso) y el usuario confirma en una tabla, con vista previa del
 resultado antes de tocar nada.
 
-Dos trampas que hunden una importación y que el módulo resuelve explícitamente:
+Cuatro trampas que hunden una importación y que el módulo resuelve
+explícitamente. Las tres primeras salieron de un plano real del CEDIS y las
+tres se daban a la vez:
 
-- **Unidades.** Casi todos los planos de nave vienen en milímetros; leídos como
-  metros dan una nave de 60 km y todo falla después, lejos de la causa. Se lee
-  `$INSUNITS` y, si el plano no lo declara, se infiere del tamaño y se avisa.
-- **Qué mide la nave.** Las dimensiones salen del PERÍMETRO, no de la extensión
+- **Unidades declaradas que mienten.** El encabezado se cree, pero se verifica:
+  un plano puede declarar milímetros y estar dibujado en metros. Si la unidad
+  declarada produce una nave imposible —el caso real daba 0.15 × 0.07 m— gana
+  el tamaño, porque un CEDIS mide decenas o cientos de metros. Se avisa siempre
+  que ocurra.
+- **Contornos que no cierran exactamente.** Nadie dibuja con precisión de
+  micrón: un muro cerrado a ojo deja huecos de milímetros. Se admite una
+  holgura de 5 cm y el contorno se cierra al importarlo. Con tolerancia exacta,
+  3 mm de deriva descartaban el contorno de la nave principal.
+- **Naves de varios cuerpos.** Dos crujías, un anexo o una ampliación son
+  contornos separados en la misma capa. Se importan todos: el perímetro pasa a
+  ser la envolvente y cada cuerpo queda como área operativa, para que no se
+  acomode nada en el patio que hay entre ellos. Si el plano ya trae una capa de
+  zonas, ésas mandan y los cuerpos quedan sólo como contorno.
+- **Qué mide la nave.** Las dimensiones salen del CONTORNO, no de la extensión
   del dibujo: cotas, viñeta y norte viven fuera del edificio y lo agrandarían
   sin que nada lo delatara.
 
@@ -143,6 +162,48 @@ cluster son los que más se estorban**, justo porque concentran operadores en
 menos pasillos. La pestaña **🚧 Interferencia** muestra el mapa de congestión
 por tramo, el reparto de uso del andén, y a partir de cuántos operadores la nave
 deja de absorber gente.
+
+## Zonas: cada área con sus propias reglas
+
+Un layout no es homogéneo. Un área de piso a granel se aprovecha **sin pasillo**,
+pegando las hileras; una franja alta y angosta rinde más con las ubicaciones en
+**vertical**; y un área puede estar reservada a cierta mercancía. Con un solo
+ancho de pasillo y una sola orientación para toda la nave, alguna zona siempre
+sale perdiendo.
+
+`proponer_por_zonas` resuelve **cada zona por separado**, dentro de su propio
+rectángulo y con sus reglas: `pasillo_m` (0 = hileras pegadas), `orientacion`,
+`margen_m`, `tipos` de ubicación admitidos y la mercancía que acepta
+(`zonas_fisicas`, `familias`, `clases`). Lo que no se declara hereda el valor
+general, así que una zona sin reglas se comporta como antes.
+
+Tres cosas que conviene conocer:
+
+- **Las reglas viajan con la ubicación.** La restricción de mercancía se estampa
+  en cada slot (`zona_fisica_reservada`) y `distribuir` la respeta al repartir.
+  Filtrar sólo al generar no alcanzaría: el reparto ocurre después, y el plano
+  diría una cosa y la operación otra.
+- **La prioridad ordena el reparto.** La mercancía que ya cabe en una zona no
+  vuelve a pedir espacio en la siguiente. El descuento es por la fracción que de
+  verdad cupo —si la zona pidió R ubicaciones y cabían P, atendió P/R de lo que
+  vio—: es monótono y no puede pasarse. Estimarlo por capacidad teórica vaciaba
+  el catálogo en las dos primeras zonas y dejaba sin mercancía a las demás
+  aunque tuvieran espacio de sobra.
+- **El orden de trabajo es el natural.** Primero se define el espacio —importar
+  el plano, dibujar las zonas—, después se les dan sus reglas, y sólo entonces
+  se generan las ubicaciones. La propuesta se apoya en el espacio ya definido en
+  vez de suponerlo.
+
+## Alcance de varias zonas físicas
+
+Un espacio físico no siempre corresponde a una sola zona lógica: conviene
+mezclar cuando dos zonas comparten equipo de surtido, cuando una es demasiado
+chica para justificar su propia área, o cuando el mismo pasillo puede atenderlas
+sin cruzar mercancía confinada. **Datos y alcance** admite varias zonas a la vez
+(`contexto.cargar_zonas`); cada SKU conserva su zona de origen, que es lo que
+después permite reservarle áreas del layout. Un SKU repetido entre maestros se
+conserva una sola vez y la repetición se reporta: casi siempre es un error de
+los maestros, y esconderlo produciría doble conteo de unidades.
 
 ## Métodos de surtido
 
@@ -391,10 +452,9 @@ cedis.json                   Registro de centros y contrato de archivos
 datos/compartidos/           Catálogos reutilizables entre centros
 datos/cedis/<CODIGO>/        Entradas, maestros y salidas de cada CEDIS
 pages/1_Datos.py             Datos, validación y selección del alcance
-pages/2_Diseno.py            CAD, alternativas y resultado 2D/3D
-pages/3_Operacion.py         Simulación operativa
-pages/4_Comparativa.py       Métodos de surtido, comparativa y animación
-pages/5_Escenarios.py        Versiones, comparación y descargas
+pages/2_Diseno.py            Plano CAD, ubicaciones y resultado 2D/3D
+pages/3_Operacion.py         Simulación, métodos, animación e interferencia
+pages/4_Escenarios.py        Versiones, comparación y descargas
 pages/1_Validacion_de_datos.py Calidad de datos auxiliar
 slotting/io.py               Normalización, catálogos y trazabilidad
 slotting/facilities.py       Registro y archivos independientes por CEDIS
@@ -413,6 +473,8 @@ slotting/profiles/           Variantes aisladas de cálculo por CEDIS
 slotting/slots.py            Fachada de compatibilidad heredada
 slotting/sim.py              Pedidos, recorridos y modelo de tiempos
 slotting/cad_import.py       Importación de planos DWG y DXF por capas
+slotting/parametros.py       Parámetros de operación, declarados una sola vez
+slotting/engine/layout.py    Generación global y zona por zona
 slotting/entrega.py          Frente de andén: dónde empieza y termina un viaje
 slotting/interferencia.py    Congestión entre operadores en los pasillos
 slotting/metodos.py          Métodos de surtido y motor de eventos discretos

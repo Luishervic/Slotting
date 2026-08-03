@@ -621,6 +621,19 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
                     and str(slot["clase_abc_reservada"]).upper()
                     != str(sku.get("clase_abc", "")).upper()):
                 continue
+            # Zona física de ORIGEN de la mercancía. Con un alcance que mezcla
+            # varias zonas —piso y rack en el mismo espacio, por ejemplo— hace
+            # falta poder decir qué admite cada área del layout; sin esto, un
+            # área reservada a una zona recibía mercancía de cualquier otra.
+            reserva_zf = slot.get("zona_fisica_reservada")
+            if reserva_zf:
+                permitidas = (reserva_zf if isinstance(reserva_zf, (list, tuple, set))
+                              else [reserva_zf])
+                permitidas = {str(z).strip().upper() for z in permitidas
+                              if str(z).strip()}
+                if permitidas and str(
+                        sku.get("zona_fisica", "")).strip().upper() not in permitidas:
+                    continue
             if (cfg.respetar_zona and slot.get("zona")
                     and str(slot["zona"]) != str(sku.get("zona_propuesta"))):
                 continue
@@ -1342,7 +1355,21 @@ def _proponer_core(df, cfg: SlotConfig, pasillo_m: float, tipos: list[dict],
                    umbral_multisku: int, obstaculos: list[dict],
                    perimetro: list | None = None,
                    zonas: list[dict] | None = None,
-                   max_ubic: dict | None = None) -> dict:
+                   max_ubic: dict | None = None,
+                   ventana: tuple | None = None,
+                   margen_m: float = 0.5) -> dict:
+    """Acomoda el catálogo tilando un rectángulo del lienzo.
+
+    `ventana` = (x0, y0, x1, y1) acota DÓNDE se tila. Sin ella se usa el lienzo
+    completo, que es el comportamiento histórico. Con ella, la generación puede
+    correrse zona por zona: cada zona arranca en su propia esquina y avanza
+    dentro de sus límites, en vez de barrer toda la nave y descartar lo que cae
+    fuera. La diferencia se nota en zonas angostas o alejadas del origen, donde
+    el barrido global desperdiciaba el frente de la zona.
+
+    `margen_m` es la holgura contra el borde de la ventana. Se expone porque una
+    zona de piso a granel no necesita separación y otra de rack sí.
+    """
     gap_m = 0.03
     max_ubic = {str(k): max(1, int(v)) for k, v in (max_ubic or {}).items()}
     fuente = df[df.get("unidades", 0).fillna(0) > 0].copy()
@@ -1454,8 +1481,12 @@ def _proponer_core(df, cfg: SlotConfig, pasillo_m: float, tipos: list[dict],
                .drop(columns=["_clase_rank", "_area"]).reset_index(drop=True))
 
     obst = obstaculos or []
+    x0, y0, x1, y1 = ventana or (0.0, 0.0, cfg.ancho_m, cfg.largo_m)
+    m = max(float(margen_m), 0.0)
+    x_ini, y_ini = x0 + m, y0 + m
+    x_fin, y_fin = x1 - m, y1 - m
     slots, sin_espacio, n = [], 0, 0
-    y_cursor = 0.5
+    y_cursor = y_ini
     fila_global = 0
     for _, f in resumen.iterrows():
         clase, tcode = f["clase_comercial"], f["tipo_codigo"]
@@ -1464,19 +1495,19 @@ def _proponer_core(df, cfg: SlotConfig, pasillo_m: float, tipos: list[dict],
         for multis, cnt in ((False, int(f["ubic_mono"])), (True, int(f["ubic_multi"]))):
             if cnt <= 0:
                 continue
-            x, y = 0.5, y_cursor
+            x, y = x_ini, y_cursor
             y_ult = None   # última fila donde de verdad se colocó algo
             for _i in range(cnt):
                 colocada = False
-                while y + d_loc <= cfg.largo_m - 0.5 + 1e-9:
-                    if x + w_loc > cfg.ancho_m - 0.5 + 1e-9:
+                while y + d_loc <= y_fin + 1e-9:
+                    if x + w_loc > x_fin + 1e-9:
                         separacion = (
                             0.05
                             if cfg.estrategia_pasillo == "espejo"
                             and fila_global % 2 == 0
                             else pasillo_m
                         )
-                        x, y = 0.5, y + d_loc + separacion
+                        x, y = x_ini, y + d_loc + separacion
                         fila_global += 1
                         continue
                     cand = {"x": x, "y": y, "w": w_loc, "d": d_loc}
@@ -1611,6 +1642,245 @@ def proponer_layout(df, cfg: SlotConfig, pasillo_m: float = 3.5,
         "cap_loc": int(resumen["cap_loc"].iloc[0]) if not resumen.empty else 0,
     })
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Generación por zonas
+# --------------------------------------------------------------------------- #
+# Reglas que puede llevar cada zona del layout. Todas son opcionales: lo que no
+# se declara hereda el valor general, así que una zona sin reglas se comporta
+# exactamente como antes.
+CAMPOS_REGLA_ZONA = ("pasillo_m", "orientacion", "margen_m", "tipos",
+                     "zonas_fisicas", "familias", "clases", "solo_mono",
+                     "solo_multi")
+
+
+def _lista(valor) -> list[str]:
+    """Normaliza un campo que puede venir como lista, texto separado o vacío."""
+    if valor is None or (isinstance(valor, float) and math.isnan(valor)):
+        return []
+    if isinstance(valor, (list, tuple, set)):
+        return [str(v).strip() for v in valor if str(v).strip()]
+    texto = str(valor).strip()
+    if not texto or texto.lower() in ("nan", "none"):
+        return []
+    return [p.strip() for p in texto.replace(";", ",").split(",") if p.strip()]
+
+
+def _catalogo_de_zona(df: pd.DataFrame, regla: dict) -> pd.DataFrame:
+    """Mercancía que esta zona admite.
+
+    Filtra por zona física de origen, familia y clase comercial. Un filtro vacío
+    significa «cualquiera», que es lo que quiere decir no haber declarado nada.
+    """
+    d = df
+    for campo, columna in (("zonas_fisicas", "zona_fisica"),
+                           ("familias", "familia"),
+                           ("clases", "clase_comercial")):
+        permitidos = _lista(regla.get(campo))
+        if permitidos and columna in d.columns:
+            valores = d[columna].astype("string").str.strip().str.upper()
+            d = d[valores.isin({p.upper() for p in permitidos})]
+    return d
+
+
+def _ventana_zona(zona: dict) -> tuple:
+    """Rectángulo envolvente de la zona, que es donde se tila."""
+    poly = zona.get("poligono")
+    if poly:
+        xs = [float(p[0]) for p in poly]
+        ys = [float(p[1]) for p in poly]
+        return (min(xs), min(ys), max(xs), max(ys))
+    return (float(zona["x"]), float(zona["y"]),
+            float(zona["x"]) + float(zona["w"]),
+            float(zona["y"]) + float(zona["d"]))
+
+
+def proponer_por_zonas(df: pd.DataFrame, cfg: SlotConfig,
+                       tipos: list[dict] | None = None,
+                       pasillo_m: float = 3.5,
+                       orientacion_pasillo: str = "horizontal",
+                       margen_m: float = 0.5,
+                       umbral_multisku: int = 10,
+                       max_ubic: dict | None = None,
+                       obstaculos: list[dict] | None = None,
+                       reglas: dict | None = None) -> dict:
+    """Genera ubicaciones ZONA POR ZONA, cada una con sus propias reglas.
+
+    `proponer_layout` trata las zonas como un filtro: tila la nave entera con un
+    solo ancho de pasillo y una sola orientación, y descarta lo que cae fuera.
+    Eso impide dos cosas que la operación sí necesita:
+
+        - Que una zona no lleve pasillo. Un área de piso a granel o de
+          preparación se aprovecha pegando las posiciones; obligarla al pasillo
+          general regala metros cuadrados.
+        - Que la orientación cambie de zona a zona. Una franja ancha y baja se
+          llena con hileras horizontales; una alta y angosta, con verticales.
+          Con una orientación global, una de las dos siempre sale perdiendo.
+
+    Aquí cada zona se resuelve por separado, dentro de su propio rectángulo y
+    con su propio pasillo, orientación, margen, tipos de ubicación y mercancía
+    admitida. `reglas` es {nombre_de_zona: {...}}; lo que no se declare hereda
+    los valores generales que recibe esta función.
+
+    Un SKU se coloca en la PRIMERA zona que lo admite, siguiendo `prioridad`.
+    Así, declarar una zona restringida con prioridad alta la reserva de verdad,
+    en vez de competir con el resto por la misma mercancía.
+    """
+    zonas = [dict(z) for z in (cfg.zonas or [])]
+    if not zonas:
+        raise ValueError(
+            "No hay zonas definidas en el layout. Dibújalas en el editor CAD, "
+            "impórtalas del plano, o usa la generación de nave completa.")
+    reglas = {str(k): dict(v) for k, v in (reglas or {}).items()}
+    obstaculos = obstaculos or []
+    if not tipos:
+        raise ValueError("Hace falta al menos un tipo de ubicación.")
+
+    zonas.sort(key=lambda z: (float(z.get("prioridad") or 1e9),
+                              str(z.get("nombre") or "")))
+
+    pendientes = df.copy()
+    slots: list[dict] = []
+    resumenes, detalle = [], []
+    n_global = 0
+
+    for zona in zonas:
+        nombre = str(zona.get("nombre") or f"Zona {len(detalle) + 1}")
+        regla = reglas.get(nombre, {})
+        admitida = _catalogo_de_zona(pendientes, regla)
+        tipos_z = _lista(regla.get("tipos"))
+        tipos_zona = ([t for t in tipos if str(t.get("codigo")) in tipos_z]
+                      or tipos)
+        pas_z = regla.get("pasillo_m")
+        pas_z = float(pasillo_m if pas_z is None or
+                      (isinstance(pas_z, float) and math.isnan(pas_z))
+                      else pas_z)
+        mar_z = regla.get("margen_m")
+        mar_z = float(margen_m if mar_z is None or
+                      (isinstance(mar_z, float) and math.isnan(mar_z))
+                      else mar_z)
+        ori_z = str(regla.get("orientacion") or orientacion_pasillo).lower()
+        if ori_z not in ("horizontal", "vertical"):
+            ori_z = orientacion_pasillo
+
+        if admitida.empty:
+            detalle.append({"zona": nombre, "ubicaciones": 0, "skus": 0,
+                            "pasillo_m": pas_z, "orientacion": ori_z,
+                            "sin_espacio": 0,
+                            "motivo": "ningún SKU pendiente cumple sus reglas"})
+            continue
+
+        # La zona se resuelve como un problema propio: su ventana, su pasillo y
+        # su orientación. Para la orientación vertical se transpone igual que en
+        # `proponer_layout`, pero acotado a esta zona.
+        vertical = ori_z == "vertical"
+        zona_geo = {**zona}
+        if vertical:
+            cfg_z = replace(cfg, largo_m=cfg.ancho_m, ancho_m=cfg.largo_m)
+            obst_z = [{**o, "x": o["y"], "y": o["x"], "w": o["d"], "d": o["w"]}
+                      for o in obstaculos]
+            perim_z = [(y, x) for x, y in (cfg.perimetro or [])]
+            if zona_geo.get("poligono"):
+                zona_geo["poligono"] = [(y, x) for x, y in zona_geo["poligono"]]
+            else:
+                zona_geo = {**zona_geo, "x": zona["y"], "y": zona["x"],
+                            "w": zona["d"], "d": zona["w"]}
+        else:
+            cfg_z, obst_z, perim_z = cfg, obstaculos, cfg.perimetro
+
+        out = _proponer_core(
+            admitida, cfg_z, pas_z, tipos_zona, umbral_multisku, obst_z,
+            perim_z, [zona_geo], max_ubic,
+            ventana=_ventana_zona(zona_geo), margen_m=mar_z)
+
+        nuevos = out["slots"]
+        if vertical and nuevos:
+            nuevos = [{**s, "x": s["y"], "y": s["x"], "w": s["d"], "d": s["w"]}
+                      for s in nuevos]
+        # Los identificadores se renumeran a nivel layout: cada zona los generó
+        # empezando en 1 y colisionarían entre sí.
+        zf_regla = _lista(regla.get("zonas_fisicas"))
+        fam_regla = _lista(regla.get("familias"))
+        for s in nuevos:
+            n_global += 1
+            s["id"] = f"{str(cfg.codigo_zona).upper()}-U{n_global:04d}"
+            s["zona_layout"] = nombre
+            # Las reglas de la zona viajan CON la ubicación. Filtrar sólo al
+            # generar no alcanza: el reparto de SKU a ubicación ocurre después,
+            # en `distribuir`, y sin la reserva estampada metería en esta zona
+            # mercancía que sus reglas no admiten.
+            if zf_regla:
+                s["zona_fisica_reservada"] = zf_regla
+            if len(fam_regla) == 1:
+                s["familia_reservada"] = fam_regla[0]
+        # Las ubicaciones nuevas no pueden encimarse con las de zonas previas:
+        # dos zonas dibujadas con un traslape pequeño lo producirían.
+        limpios = [s for s in nuevos
+                   if not any(_solapan(s, p, 1e-6) for p in slots)]
+        descartados = len(nuevos) - len(limpios)
+        slots += limpios
+
+        if not out["resumen"].empty:
+            r = out["resumen"].copy()
+            r.insert(0, "zona", nombre)
+            resumenes.append(r)
+
+        detalle.append({
+            "zona": nombre, "ubicaciones": len(limpios),
+            "skus": int(admitida["sku"].astype(str).nunique()),
+            "pasillo_m": pas_z, "orientacion": ori_z, "margen_m": mar_z,
+            "tipos": ", ".join(str(t.get("codigo")) for t in tipos_zona),
+            "sin_espacio": int(out["meta"].get("sin_espacio", 0)),
+            "solapados_descartados": descartados,
+            "motivo": None if limpios else "no cupo ninguna ubicación",
+        })
+
+        # La mercancía que esta zona ya puede alojar no vuelve a pedir espacio
+        # en la siguiente: si no se descuenta, cada zona dimensiona para el
+        # catálogo COMPLETO y el layout sale con varias veces las ubicaciones
+        # que hacen falta.
+        #
+        # Se descuenta por la FRACCIÓN QUE DE VERDAD CUPO: si la zona pidió R
+        # ubicaciones y sólo cabían P, atendió P/R de la mercancía que vio, y
+        # se retira esa proporción de SKUs en el mismo orden en que el motor
+        # los acomoda. La regla es monótona y no puede pasarse: si no cupo
+        # nada, no se descuenta nada; si cupo todo, se descuenta todo.
+        #
+        # Estimarlo por capacidad teórica —lo primero que intenté— vaciaba el
+        # catálogo en las dos primeras zonas y dejaba sin mercancía a las ocho
+        # restantes, aunque tuvieran espacio de sobra.
+        if limpios and not admitida.empty:
+            pedidas = (int(out["resumen"]["ubicaciones"].sum())
+                       if not out["resumen"].empty else len(limpios))
+            fraccion = min(len(limpios) / max(pedidas, 1), 1.0)
+            orden = _orden_skus(admitida, cfg)
+            n_consumidos = int(round(fraccion * len(orden)))
+            if n_consumidos:
+                atendidos = set(
+                    orden["sku"].astype(str).iloc[:n_consumidos])
+                pendientes = pendientes[
+                    ~pendientes["sku"].astype(str).isin(atendidos)]
+
+    resumen = (pd.concat(resumenes, ignore_index=True) if resumenes
+               else pd.DataFrame())
+    df_detalle = pd.DataFrame(detalle)
+    return {
+        "slots": slots,
+        "resumen": resumen,
+        "por_zona": df_detalle,
+        "meta": {
+            "total": len(slots),
+            "zonas": len(zonas),
+            "zonas_con_ubicaciones": int((df_detalle["ubicaciones"] > 0).sum())
+            if not df_detalle.empty else 0,
+            "sin_espacio": int(df_detalle["sin_espacio"].sum())
+            if not df_detalle.empty else 0,
+            "n_tipos": len(tipos),
+            "orientacion_pasillo": orientacion_pasillo,
+            "por_zona": detalle,
+        },
+    }
 
 
 def _distancia_surtido_estimada(df: pd.DataFrame, res: dict,
