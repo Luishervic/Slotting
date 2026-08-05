@@ -12,10 +12,12 @@ _CAD = components.declare_component(
 
 
 def editor(perimetro, obstaculos, accesos, zonas, ubicaciones,
-           ancho_m, largo_m, rejilla_m, *, key: str):
+           ancho_m, largo_m, rejilla_m, *, tipos=None, catalogos=None,
+           key: str):
     return _CAD(mode="editor",
                 perimetro=perimetro or [], obstaculos=obstaculos or [],
                 accesos=accesos or [], zonas=zonas or [], ubicaciones=ubicaciones or [],
                 ancho=float(ancho_m), largo=float(largo_m),
-                rejilla=float(rejilla_m), height=720,
+                rejilla=float(rejilla_m), tipos=tipos or [],
+                catalogos=catalogos or {}, height=760,
                 default=None, key=key)

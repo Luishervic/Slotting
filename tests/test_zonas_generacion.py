@@ -231,6 +231,22 @@ class TestGeneracionPorZonas(BaseZonas):
                   if s["zona_layout"] == "Piso a granel"}
         self.assertTrue(usados <= {codigo})
 
+    def test_la_estructura_elegida_en_el_mapa_no_requiere_perfil_previo(self):
+        """La zona física manda aunque no se haya configurado una estructura
+        con el mismo nombre en el catálogo de mercancía."""
+        zona = [{"nombre": "Rack nuevo", "x": 0.0, "y": 0.0,
+                 "w": 40.0, "d": 18.0, "prioridad": 1}]
+        cfg = S.SlotConfig(ancho_m=40.0, largo_m=18.0, zonas=zona)
+        out = S.proponer_por_zonas(
+            self.df, cfg, tipos=self.tipos, pasillo_m=3.0,
+            reglas={"Rack nuevo": {"tipo_estructura": "RACK",
+                                      "modo_pasillo": "con"}},
+            estructuras={})
+        self.assertTrue(out["slots"])
+        self.assertEqual(out["por_zona"].iloc[0]["estructura"], "RACK")
+        self.assertTrue(all(s.get("tipo_estructura") == "RACK"
+                            for s in out["slots"]))
+
     def test_la_ventana_de_tilado_no_altera_la_generacion_global(self):
         """El comportamiento histórico tiene que poder reproducirse."""
         cfg = S.SlotConfig(ancho_m=72.0, largo_m=34.0)
@@ -269,6 +285,18 @@ class TestReservaZonaFisica(unittest.TestCase):
     def test_sin_reserva_entra_cualquier_mercancia(self):
         res = S.distribuir(self.df, self._slots(None), self.cfg)
         self.assertFalse(res["asignaciones"].empty)
+
+    def test_reserva_multiple_de_departamento_se_respeta(self):
+        self.df["departamento"] = ["D1" if i % 3 else "D2"
+                                   for i in range(len(self.df))]
+        slots = self._slots(None)
+        for slot in slots:
+            slot["departamento_reservado"] = ["D1"]
+        res = S.distribuir(self.df, slots, self.cfg)
+        depto = dict(zip(self.df["sku"].astype(str), self.df["departamento"]))
+        self.assertFalse(res["asignaciones"].empty)
+        self.assertTrue(all(depto[sku] == "D1"
+                            for sku in res["asignaciones"]["sku"].astype(str)))
 
 
 if __name__ == "__main__":

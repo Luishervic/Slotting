@@ -6,45 +6,18 @@ las zonas dibujadas se optimiza después, usando este catálogo como restricció
 """
 from __future__ import annotations
 
-import re
-import unicodedata
 from dataclasses import replace
 
 import pandas as pd
 
 from slotting import structures as ST
+from slotting import perfiles_localidad as PL
 from slotting.engine.registry import get_profile
 
 
 def _clave_zona(valor: object) -> str:
     texto = str(valor or "SIN_ZONA").strip().upper()
     return texto if texto and texto not in ("NAN", "NONE", "<NA>") else "SIN_ZONA"
-
-
-def _prefijo(valor: str) -> str:
-    texto = unicodedata.normalize("NFKD", _clave_zona(valor))
-    texto = texto.encode("ascii", "ignore").decode("ascii")
-    partes = [p for p in re.split(r"[^A-Z0-9]+", texto.upper()) if p]
-    base = "".join(p[:3] for p in partes)[:8] or "ZONA"
-    return base
-
-
-def _catalogo_con_prefijo(tipos: list[dict], zona: str,
-                          estructura: dict) -> list[dict]:
-    prefijo = _prefijo(zona)
-    salida = []
-    for i, original in enumerate(tipos, start=1):
-        t = dict(original)
-        codigo = f"{prefijo}-T{i:02d}"
-        t.update({
-            "codigo": codigo,
-            "tipo": f"{zona} · Tipo {i}",
-            "zona_fisica": zona,
-            "tipo_estructura": estructura.get("tipo_estructura", "PISO"),
-            "estado_medidas": estructura.get("estado_medidas", "PROVISIONAL"),
-        })
-        salida.append(t)
-    return salida
 
 
 def _separar_frente_reserva(df: pd.DataFrame, modo: str) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -123,13 +96,14 @@ def calcular_capacidad_por_zona_fisica(
         max_tipos: int = 4, modo_inventario: str = "total",
         tolerancia_complejidad_pct: float = 3.0,
         umbral_multisku: int = 10,
-        engine_profile: str = "default") -> dict:
-    """Calcula un catálogo de localidades independiente para cada mercancía.
+        engine_profile: str = "default",
+        df_catalogo_fisico: pd.DataFrame | None = None) -> dict:
+    """Calcula tipos físicos y después la cantidad requerida por mercancía.
 
-    Se prueban de 1 a ``max_tipos`` por zona. Primero se minimizan los SKU que
-    no caben en la estructura y luego los m² físicos. Si una alternativa con
-    menos tipos queda dentro de ``tolerancia_complejidad_pct`` del mínimo, se
-    prefiere la más simple para evitar fragmentar capacidad por ahorros menores.
+    Las dimensiones y el número de tipos se deciden exclusivamente con largo,
+    ancho, alto y la estructura. ABC e inventario no modifican X/Y/Z. Una vez
+    aprobado el catálogo, el inventario sí determina cuántas localidades y
+    módulos hacen falta.
     """
     S = get_profile(engine_profile)
     if df is None or df.empty:
@@ -142,8 +116,12 @@ def calcular_capacidad_por_zona_fisica(
         fuente["zona_fisica"] = "SIN_ZONA"
     fuente["_zona_capacidad"] = fuente["zona_fisica"].map(_clave_zona)
     max_tipos = max(1, min(int(max_tipos), 8))
-    tolerancia = max(0.0, float(tolerancia_complejidad_pct)) / 100.0
-    filas_zona, filas_alt, detalles, excepciones, tipos_elegidos = [], [], [], [], []
+    filas_zona, detalles, excepciones, tipos_elegidos = [], [], [], []
+    fuente_tipos = (df_catalogo_fisico
+                    if df_catalogo_fisico is not None else fuente)
+    catalogo_geo = PL.calcular_catalogo_geometrico(
+        fuente_tipos, estructuras, max_tipos=max_tipos,
+        tolerancia_simplificacion_pp=float(tolerancia_complejidad_pct))
 
     for zona, d_zona in fuente.groupby("_zona_capacidad", sort=True):
         d_zona = d_zona.drop(columns="_zona_capacidad").copy()
@@ -159,53 +137,37 @@ def calcular_capacidad_por_zona_fisica(
             excepciones.append({"zona_fisica": zona, "sku": sku,
                                 "motivo": "no cabe en la estructura configurada"})
 
+        tipos = [dict(t) for t in catalogo_geo["tipos"]
+                 if _clave_zona(t.get("zona_fisica")) == zona]
         candidatos = []
-        if not compatibles.empty:
+        if not compatibles.empty and tipos:
             frente, reserva = _separar_frente_reserva(
                 compatibles, modo_inventario)
-            for n_tipos in range(1, min(max_tipos, len(compatibles)) + 1):
-                es_rack = str(estructura["tipo_estructura"]).upper() == "RACK"
-                tipos_base = S.calcular_tipos_optimos(
-                    compatibles, n_tipos=n_tipos,
-                    max_w_m=float(estructura["ancho_modulo_m"])
-                    if es_rack else None,
-                    max_d_m=float(estructura["fondo_modulo_m"])
-                    if es_rack else None,
-                    modo_rack=es_rack)
-                tipos = _catalogo_con_prefijo(tipos_base, zona, estructura)
-                if not tipos:
-                    continue
-                cap_frente = _dimensionar(
-                    frente, cfg, tipos, estructura, umbral_multisku, S)
-                cap_reserva = _dimensionar(
-                    reserva, cfg, tipos, estructura, umbral_multisku, S)
-                candidatos.append({
-                    "zona_fisica": zona, "n_tipos": len(tipos),
-                    "tipos": tipos, "estructura": estructura,
-                    "frente": cap_frente, "reserva": cap_reserva,
-                    "localidades_surtido": cap_frente["localidades"],
-                    "localidades_reserva": cap_reserva["localidades"],
-                    "localidades_total": (cap_frente["localidades"]
-                                           + cap_reserva["localidades"]),
-                    "modulos_surtido": cap_frente["modulos"],
-                    "modulos_reserva": cap_reserva["modulos"],
-                    "modulos_total": (cap_frente["modulos"]
-                                      + cap_reserva["modulos"]),
-                    "m2_estructura": round(cap_frente["m2"]
-                                            + cap_reserva["m2"], 2),
-                    "skus_sin_cabida": len(set(d_zona["sku"].astype(str))
-                                             - ids_compatibles),
-                })
+            es_rack = str(estructura["tipo_estructura"]).upper() == "RACK"
+            cap_frente = _dimensionar(
+                frente, cfg, tipos, estructura, umbral_multisku, S)
+            cap_reserva = _dimensionar(
+                reserva, cfg, tipos, estructura, umbral_multisku, S)
+            candidatos.append({
+                "zona_fisica": zona, "n_tipos": len(tipos),
+                "tipos": tipos, "estructura": estructura,
+                "frente": cap_frente, "reserva": cap_reserva,
+                "localidades_surtido": cap_frente["localidades"],
+                "localidades_reserva": cap_reserva["localidades"],
+                "localidades_total": (cap_frente["localidades"]
+                                       + cap_reserva["localidades"]),
+                "modulos_surtido": cap_frente["modulos"],
+                "modulos_reserva": cap_reserva["modulos"],
+                "modulos_total": (cap_frente["modulos"]
+                                  + cap_reserva["modulos"]),
+                "m2_estructura": round(cap_frente["m2"]
+                                        + cap_reserva["m2"], 2),
+                "skus_sin_cabida": len(set(d_zona["sku"].astype(str))
+                                         - ids_compatibles),
+            })
 
         if candidatos:
-            min_excl = min(c["skus_sin_cabida"] for c in candidatos)
-            comparables = [c for c in candidatos
-                           if c["skus_sin_cabida"] == min_excl]
-            min_area = min(c["m2_estructura"] for c in comparables)
-            cercanos = [c for c in comparables
-                        if c["m2_estructura"] <= min_area * (1.0 + tolerancia) + 1e-9]
-            elegido = min(cercanos, key=lambda c: (c["n_tipos"],
-                                                    c["m2_estructura"]))
+            elegido = candidatos[0]
             tipos_elegidos.extend(elegido["tipos"])
             es_rack = str(estructura["tipo_estructura"]).upper() == "RACK"
             for uso, cap in (("Surtido", elegido["frente"]),
@@ -213,15 +175,6 @@ def calcular_capacidad_por_zona_fisica(
                 detalle = _detalle_por_tipo(cap["resumen"], zona, uso, es_rack)
                 if not detalle.empty:
                     detalles.append(detalle)
-            for candidato in candidatos:
-                filas_alt.append({
-                    "zona_fisica": zona, "seleccionada": candidato is elegido,
-                    "n_tipos": candidato["n_tipos"],
-                    "localidades": candidato["localidades_total"],
-                    "modulos": candidato["modulos_total"],
-                    "m2_estructura": candidato["m2_estructura"],
-                    "skus_sin_cabida": candidato["skus_sin_cabida"],
-                })
             frente_unid = int(pd.to_numeric(
                 _separar_frente_reserva(compatibles, modo_inventario)[0]
                 .get("unidades", 0), errors="coerce").fillna(0).sum())
@@ -271,9 +224,10 @@ def calcular_capacidad_por_zona_fisica(
         "excepciones": int(len(tabla_exc)),
     }
     return {"por_zona": por_zona, "por_tipo": por_tipo,
-            "alternativas": pd.DataFrame(filas_alt),
+            "alternativas": catalogo_geo["alternativas"],
             "excepciones": tabla_exc, "tipos": tipos_elegidos,
-            "totales": totales, "modo_inventario": modo_inventario}
+            "totales": totales, "modo_inventario": modo_inventario,
+            "asignaciones_tipo": catalogo_geo["asignaciones"]}
 
 
 def vincular_tipos_a_reglas(reglas: dict, tipos: list[dict],

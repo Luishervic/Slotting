@@ -13,6 +13,7 @@ import streamlit as st
 from slotting.engine.registry import get_profile
 from slotting import capacidad_zonas as CZ
 from slotting import cad_import as CAD
+from slotting import perfiles_localidad as PL
 from slotting import structures as ST
 from slotting import viz
 from slotting.cad_editor import editor as editor_cad
@@ -24,6 +25,11 @@ from slotting.geometry import (area_poligono, normalizar_poligono,
                                poligono_contenido, poligono_en_lienzo,
                                poligono_simple, poligonos_se_solapan,
                                rectangulo_en_poligono)
+from slotting.design_workspace import render as render_design_workspace
+
+
+render_design_workspace()
+st.stop()
 
 S = get_profile(st.session_state.get("cedis_engine_profile", "default"))
 
@@ -184,7 +190,7 @@ navegacion("diseno")
 titulo_pagina(
     "Paso 2 de 3",
     "Diseñar almacén",
-    "Calcula la capacidad, configura las zonas y optimiza su acomodo.",
+    "Define localidades estándar y distribúyelas por zona sobre el plano CAD.",
 )
 
 if "df" not in st.session_state:
@@ -245,10 +251,10 @@ st.caption(
     f"Objetivo: **{etiqueta_escenario}** · {col_unidades} × "
     f"{factor_escenario:.2f}. Para cambiarlo vuelve a **Datos y demanda**."
 )
-with st.expander("0 · Reglas generales del diseño", expanded=True):
+with st.expander("Criterios generales de capacidad (opcional)", expanded=False):
     st.caption(
-        "Estas reglas se aplican a todo el almacén. Las excepciones por zona "
-        "se configuran junto a la generación de ubicaciones."
+        "Aquí solo se definen criterios transversales. La estructura, los "
+        "pasillos y la orientación se configuran después dentro de cada zona."
     )
     # Respaldo tabular para recuperar un plano existente; la edición normal se
     # realiza en el CAD para no duplicar flujos.
@@ -394,24 +400,16 @@ with st.expander("0 · Reglas generales del diseño", expanded=True):
         orden_sel = ["clase_abc", "unidades"]
         umbral_rep = 2
         st.info(
-            "Perfil equilibrado: pasillo 3.5 m, altura 8 m, familias juntas "
-            "y prioridad ABC + inventario. Usa Personalizado sólo si estas "
-            "condiciones no representan la operación."
+            "Perfil equilibrado: altura libre de 8 m y familias juntas. "
+            "Pasillo y orientación se resolverán individualmente por zona."
         )
     else:
-        fisica_1, fisica_2 = st.columns(2)
-        pasillo = fisica_1.slider(
-            "Pasillo entre filas (m)", 1.0, 6.0, 3.5, 0.1
-        )
-        altura = fisica_2.slider(
+        pasillo = 3.5
+        orientacion = "horizontal"
+        st.session_state["orientacion_pasillo"] = orientacion
+        altura = st.slider(
             "Altura libre a techo (m)", 2.0, 14.0, 8.0, 0.5
         )
-        orientacion = st.radio(
-            "Orientación de pasillos", ["horizontal", "vertical"],
-            format_func={"horizontal": "Horizontal (filas)",
-                         "vertical": "Vertical (columnas)"}.get,
-            horizontal=True, key="orientacion_pasillo",
-            help="La orientación gira 90° todo el acomodo propuesto.")
         reglas_1, reglas_2 = st.columns(2)
         umbral_viable = reglas_1.number_input(
             "Mínimo para acomodo dedicado", 1, 500, 10, 1,
@@ -460,6 +458,7 @@ _sku_str = df["sku"].astype(str)
 _sobrestock = set(st.session_state.get("skus_sobrestock", []))
 df_viable_base = df[_unid >= umbral_viable]
 df_viable = S.filtrar_dimensiones_validas(df_viable_base)
+df_catalogo_fisico = S.filtrar_dimensiones_validas(df[_unid > 0])
 df_especial_base = S.filtrar_dimensiones_validas(
     df[(_unid > 0) & (_unid < umbral_viable)])
 _skus_dim_pend = int(df_viable_base["sku"].astype(str).nunique()
@@ -467,11 +466,11 @@ _skus_dim_pend = int(df_viable_base["sku"].astype(str).nunique()
 _max_ubic = {s: max(1, int(umbral_rep) - 1) for s in _sobrestock}
 st.session_state["max_ubic_sobrestock"] = _max_ubic
 
-st.subheader("1 · Calcular localidades")
+st.subheader("1 · Definir perfiles y localidades ideales")
 st.caption(
-    "Cada zona física recibe sus propios tipos de localidad según su mercancía "
-    "y estructura. Primero se calcula la necesidad; el plano sólo determina "
-    "después cómo acomodarla.")
+    "Primero se decide si basta el área física o si departamento, clase o "
+    "familia explican diferencias reales de tamaño. Después se generan tallas "
+    "X/Y/Z con largo, ancho y alto; ABC no interviene en este cálculo.")
 cap1, cap2, cap3 = st.columns([1, 1.4, 1.6])
 _max_tipos_zona = cap1.number_input(
     "Máx. tipos por zona", 1, 8, 4, 1, key="max_tipos_por_zona",
@@ -499,11 +498,13 @@ _estructuras_por_zf = {
 _firma_capacidad = (
     st.session_state.get("fuente_firma"), etiqueta_escenario, col_unidades,
     float(factor_escenario), int(_max_tipos_zona), _modo_capacidad,
-    int(umbral_viable))
+    int(umbral_viable), len(df_catalogo_fisico))
 if (_recalcular_capacidad
         or st.session_state.get("firma_capacidad_zonas") != _firma_capacidad):
     if not df_viable.empty:
-        with st.spinner("Calculando tipos, localidades y módulos por zona…"):
+        with st.spinner("Analizando perfiles y calculando localidades ideales…"):
+            st.session_state["analisis_granularidad"] = PL.analizar_granularidad(
+                df_catalogo_fisico)
             st.session_state["capacidad_zonas"] = CZ.calcular_capacidad_por_zona_fisica(
                 df_viable, _estructuras, cfg,
                 max_tipos=int(_max_tipos_zona),
@@ -511,7 +512,8 @@ if (_recalcular_capacidad
                 tolerancia_complejidad_pct=3.0,
                 umbral_multisku=int(umbral_viable),
                 engine_profile=st.session_state.get(
-                    "cedis_engine_profile", "default"))
+                    "cedis_engine_profile", "default"),
+                df_catalogo_fisico=df_catalogo_fisico)
         st.session_state["firma_capacidad_zonas"] = _firma_capacidad
         st.session_state["tipos_catalogo"] = st.session_state[
             "capacidad_zonas"]["tipos"]
@@ -519,11 +521,29 @@ if (_recalcular_capacidad
         st.session_state["tipos_rev"] = st.session_state.get("tipos_rev", 0) + 1
 
 _capacidad_zonas = st.session_state.get("capacidad_zonas", {})
+_analisis_granularidad = st.session_state.get("analisis_granularidad", {})
 _tipos_capacidad = [t for t in st.session_state.get("tipos_catalogo", [])
                     if t.get("w") and t.get("d")]
 if df_viable.empty or not _tipos_capacidad:
     st.warning("No hay SKU con dimensiones y unidades utilizables para calcular capacidad.")
 else:
+    _recomendacion = _analisis_granularidad.get("por_zona", pd.DataFrame())
+    if not _recomendacion.empty:
+        st.markdown("**Nivel recomendado para definir la mercancía**")
+        st.dataframe(
+            _recomendacion, width="stretch", hide_index=True,
+            column_order=["zona_fisica", "definicion_recomendada",
+                          "perfiles_recomendados", "skus", "criterio"],
+            column_config={
+                "zona_fisica": "Zona física / mercancía",
+                "definicion_recomendada": "Definir por",
+                "perfiles_recomendados": "Perfiles",
+                "criterio": "Por qué",
+            })
+        st.caption(
+            "La herramienta conserva el nivel más estandarizado. Solo baja a "
+            "departamento, clase o familia si la categoría reduce al menos 15 "
+            "puntos la variación dimensional y sus grupos tienen muestra suficiente.")
     _tot_cap = _capacidad_zonas["totales"]
     cm1, cm2, cm3, cm4, cm5 = st.columns(5)
     cm1.metric("Zonas físicas", _tot_cap["zonas"])
@@ -551,12 +571,64 @@ else:
             "Estructuras con medidas pendientes: "
             + ", ".join(_medidas_pend["zona_fisica"].astype(str))
             + ". El resultado es preliminar hasta confirmar módulo, altura y carga.")
-    with st.expander("Entender y comparar el cálculo", expanded=False):
+    st.markdown("**Catálogo estándar aprobado para llevar al layout**")
+    _catalogo_vista = pd.DataFrame(_tipos_capacidad).reindex(columns=[
+        "codigo", "talla", "zona_fisica", "tipo_estructura", "w", "d", "h",
+        "orientacion_producto", "n_skus", "estado_medidas"])
+    st.dataframe(
+        _catalogo_vista, width="stretch", hide_index=True,
+        column_config={
+            "codigo": "Tipo", "talla": "Talla",
+            "zona_fisica": "Mercancía", "tipo_estructura": "Estructura",
+            "w": st.column_config.NumberColumn("X · frente (m)", format="%.2f"),
+            "d": st.column_config.NumberColumn("Y · fondo (m)", format="%.2f"),
+            "h": st.column_config.NumberColumn("Z · alto útil (m)", format="%.2f"),
+            "orientacion_producto": "Rotación de la pieza",
+            "n_skus": "SKU cubiertos", "estado_medidas": "Estado estructura",
+        })
+    with st.expander("Ajustar y aprobar X/Y/Z", expanded=False):
         st.caption(
-            "La alternativa seleccionada es la de menor huella. Si un catálogo "
-            "con menos tipos queda a menos de 3% del mínimo, se prefiere para "
-            "evitar fragmentar el almacén.")
-        st.markdown("**Alternativas evaluadas por zona**")
+            "Usa este ajuste solo cuando exista una medida constructiva o de "
+            "seguridad confirmada. El cambio queda en el mismo catálogo que "
+            "consumirá la distribución por zona.")
+        st.session_state.setdefault("tipos_rev", 0)
+        _tipos_edit_df = pd.DataFrame(
+            st.session_state["tipos_catalogo"]).reindex(columns=[
+                "codigo", "talla", "zona_fisica", "tipo_estructura",
+                "w", "d", "h", "orientacion_producto", "estado_medidas",
+                "niveles", "familia", "multisku", "cap_loc", "n_skus",
+                "n_pos_cubiertas", "tipo"])
+        for _col in ("codigo", "talla", "zona_fisica", "tipo_estructura",
+                     "orientacion_producto", "estado_medidas", "familia", "tipo"):
+            _tipos_edit_df[_col] = _tipos_edit_df[_col].astype("object")
+        _tipos_edit_df["multisku"] = _tipos_edit_df["multisku"].fillna(False).astype(bool)
+        _tipos_edit = st.data_editor(
+            _tipos_edit_df, width="stretch", hide_index=True, num_rows="fixed",
+            key=f"tipos_editor_{st.session_state['tipos_rev']}",
+            column_config={
+                "codigo": st.column_config.TextColumn("Tipo", disabled=True),
+                "talla": st.column_config.TextColumn("Talla", disabled=True),
+                "zona_fisica": st.column_config.TextColumn("Mercancía", disabled=True),
+                "tipo_estructura": st.column_config.TextColumn("Estructura", disabled=True),
+                "w": st.column_config.NumberColumn("X · frente (m)", min_value=0.1, format="%.2f"),
+                "d": st.column_config.NumberColumn("Y · fondo (m)", min_value=0.1, format="%.2f"),
+                "h": st.column_config.NumberColumn("Z · alto útil (m)", min_value=0.1, format="%.2f"),
+                "orientacion_producto": st.column_config.TextColumn("Rotación", disabled=True),
+                "estado_medidas": st.column_config.TextColumn("Estado", disabled=True),
+            },
+            column_order=["codigo", "talla", "zona_fisica", "tipo_estructura",
+                          "w", "d", "h", "orientacion_producto", "estado_medidas"])
+        _sync_tipos("tipos_catalogo", _tipos_edit, "tipos_rev")
+    with st.expander("Auditar la recomendación", expanded=False):
+        st.caption(
+            "X/Y/Z se calculan dando el mismo peso a cada SKU. Se elige la "
+            "menor cantidad de tallas que quede a 3 puntos de la mejor "
+            "eficiencia geométrica; inventario y ABC no participan.")
+        if not _analisis_granularidad.get("comparacion", pd.DataFrame()).empty:
+            st.markdown("**Área vs. departamento vs. clase vs. familia**")
+            st.dataframe(_analisis_granularidad["comparacion"],
+                         width="stretch", hide_index=True)
+        st.markdown("**Cantidad de tallas evaluada por zona**")
         st.dataframe(_capacidad_zonas["alternativas"], width="stretch",
                      hide_index=True)
         if not _capacidad_zonas["por_tipo"].empty:
@@ -572,9 +644,9 @@ else:
         f"{int(umbral_viable)} unidades). La baja rotación continúa en la "
         "zona especial de consolidación.")
 
-st.subheader("2 · Configurar las zonas")
-st.caption("Importa el plano o dibuja el contorno, divide el área en zonas y "
-           "marca columnas, restricciones y andenes.")
+st.subheader("2 · Definir zonas y su distribución")
+st.caption("Importa el CAD o dibuja el contorno. En esta misma sección cada "
+           "zona recibe mercancía, estructura, pasillos, orientación y tipos dimensionados.")
 
 # --------------------------------------------------------------------------- #
 # Importar el plano de arquitectura
@@ -927,68 +999,8 @@ if st.session_state.pop("importar_generar_ubicaciones", False):
                 "chicas que el tipo de ubicación calculado: revisa el mapeo de "
                 "capas, o baja el nº de tipos y el ancho de pasillo.")
 
-# --------------------------------------------------------------------------- #
-# Ajuste manual opcional de tipos. La propuesta automática vive en el bloque de
-# Alternativas y es la única fuente automática de layouts; esto es para afinar.
-# --------------------------------------------------------------------------- #
-with st.expander("🛠️ Avanzado · Ajustar a mano los tipos de ubicación",
-                 expanded=False):
-    st.caption(
-        "El sistema propone **tipos de ubicación**, cada uno con el tamaño "
-        "que cubre el P95 de frente y fondo de un grupo de piezas comparable "
-        "(entre más tipos pidas, más se ajusta cada ubicación al tamaño real "
-        "de lo que va a guardar, con menos espacio desperdiciado). Con 1 tipo obtienes "
-        "una sola talla estándar, calculada automáticamente. Luego se acomoda "
-        "por **familia** (las familias con más SKUs **A** toman las "
-        "cabeceras). Solo se acomodan aquí los SKUs **viables** (≥ mínimo de "
-        "unidades, ver reglas generales); los de baja rotación van a la "
-        "🗃️ Zona especial (más abajo).")
-    tipos_df = pd.DataFrame(st.session_state["tipos_catalogo"]).reindex(
-        columns=["codigo", "tipo", "zona_fisica", "tipo_estructura",
-                 "estado_medidas", "w", "d", "niveles", "familia", "multisku",
-                 "cap_loc", "n_skus", "n_pos_cubiertas"])
-    # Un catálogo vacío nace con columnas float en pandas. Streamlit no permite
-    # configurarlas como texto/check sin fijar su tipo antes del editor.
-    for col in ("codigo", "tipo", "zona_fisica", "tipo_estructura",
-                "estado_medidas", "familia"):
-        tipos_df[col] = tipos_df[col].astype("object")
-    tipos_df["multisku"] = tipos_df["multisku"].fillna(False).astype(bool)
-    st.caption("Puedes ajustar ancho/largo/niveles a mano si quieres afinar el "
-               "tamaño propuesto (p. ej. si ya usas racks de cierta medida). "
-               "Familia/Multi-SKU solo aplican si luego usas este tipo en la "
-               "**cuadrícula** manual.")
-    st.session_state.setdefault("tipos_rev", 0)
-    tipos_edit = st.data_editor(
-        tipos_df, width='stretch', hide_index=True, num_rows="fixed",
-        key=f"tipos_editor_{st.session_state['tipos_rev']}",
-        column_config={
-            "codigo": st.column_config.TextColumn("Código", help="Prefijo del ID"),
-            "tipo": st.column_config.TextColumn("Nombre"),
-            "zona_fisica": st.column_config.TextColumn(
-                "Mercancía", disabled=True),
-            "tipo_estructura": st.column_config.TextColumn(
-                "Estructura", disabled=True),
-            "estado_medidas": st.column_config.TextColumn(
-                "Estado", disabled=True),
-            "w": st.column_config.NumberColumn("Ancho (m)", format="%.2f", min_value=0.1),
-            "d": st.column_config.NumberColumn("Largo (m)", format="%.2f", min_value=0.1),
-            "niveles": st.column_config.NumberColumn("Niveles", help="Vacío = auto"),
-            "familia": st.column_config.SelectboxColumn(
-                "Familia (solo cuadrícula)", options=[""] + FAMILIAS),
-            "multisku": st.column_config.CheckboxColumn("Multi-SKU (solo cuadrícula)"),
-            "cap_loc": st.column_config.NumberColumn("Cap. estimada", disabled=True),
-            "n_skus": st.column_config.NumberColumn("SKUs cubiertos", disabled=True),
-            "n_pos_cubiertas": st.column_config.NumberColumn("Posiciones", disabled=True),
-        })
-    _sync_tipos("tipos_catalogo", tipos_edit, "tipos_rev")
-
-    st.caption(
-        "Los cambios quedan guardados y se aplican al ejecutar **Optimizar el "
-        "acomodo por zona**. Así no se genera accidentalmente toda la nave con "
-        "una sola regla.")
-
-st.subheader("3 · Optimizar el acomodo por zona")
-st.caption("Define qué admite cada zona y si debe llevar pasillos. El sistema "
+st.markdown("### Parámetros y acomodo de cada zona")
+st.caption("Define qué admite cada zona, su estructura y si debe llevar pasillos. El sistema "
            "prueba los acomodos permitidos dentro de cada una y aplica la "
            "combinación que cubre más localidades con mejor uso de la huella.")
 
@@ -997,8 +1009,9 @@ st.caption("Define qué admite cada zona y si debe llevar pasillos. El sistema "
 # su orientación y la mercancía que admite. Va ANTES de la generación porque el
 # espacio y sus reglas se definen primero; la propuesta se apoya en ellas.
 # --------------------------------------------------------------------------- #
-ZONA_REGLA_COLS = ["zona", "prioridad", "modo_pasillo", "pasillo_m", "orientacion",
-                   "margen_m", "zonas_fisicas", "familias", "tipos"]
+ZONA_REGLA_COLS = [
+    "zona", "prioridad", "zonas_fisicas", "nivel_perfil", "perfiles",
+    "estructura", "modo_pasillo", "pasillo_m", "orientacion", "margen_m", "tipos"]
 
 
 def _reglas_zona_seed(zonas, guardadas, pasillo_def, orientacion_def):
@@ -1007,17 +1020,23 @@ def _reglas_zona_seed(zonas, guardadas, pasillo_def, orientacion_def):
     for i, z in enumerate(zonas):
         nombre = str(z.get("nombre") or f"Zona {i + 1}")
         r = dict(guardadas.get(nombre, {}))
+        nivel = str(r.get("nivel_perfil") or "area_fisica")
+        perfiles = r.get("perfiles") or r.get({
+            "departamento": "departamentos", "clase": "clases",
+            "familia": "familias"}.get(nivel, ""), [])
         filas.append({
             "zona": nombre,
             "prioridad": int(z.get("prioridad") or i + 1),
+            "zonas_fisicas": ", ".join(r.get("zonas_fisicas") or []),
+            "nivel_perfil": nivel,
+            "perfiles": ", ".join(perfiles or []),
+            "estructura": str(r.get("estructura") or "Automática"),
             "modo_pasillo": str(r.get("modo_pasillo") or "auto"),
             "pasillo_m": (float(r["pasillo_m"])
                           if r.get("pasillo_m") is not None else pasillo_def),
             "orientacion": str(r.get("orientacion") or "automatica"),
             "margen_m": (float(r["margen_m"])
                          if r.get("margen_m") is not None else 0.5),
-            "zonas_fisicas": ", ".join(r.get("zonas_fisicas") or []),
-            "familias": ", ".join(r.get("familias") or []),
             "tipos": ", ".join(r.get("tipos") or []),
         })
     return pd.DataFrame(filas).reindex(columns=ZONA_REGLA_COLS)
@@ -1038,11 +1057,21 @@ def _reglas_zona_desde_tabla(edit):
             regla["modo_pasillo"] = str(r["modo_pasillo"]).strip()
         if str(r.get("orientacion") or "").strip():
             regla["orientacion"] = str(r["orientacion"]).strip()
-        for campo in ("zonas_fisicas", "familias", "tipos"):
+        for campo in ("zonas_fisicas", "tipos"):
             texto = str(r.get(campo) or "").strip()
             if texto and texto.lower() not in ("nan", "none"):
                 regla[campo] = [p.strip() for p in texto.replace(";", ",").split(",")
                                 if p.strip()]
+        nivel = str(r.get("nivel_perfil") or "area_fisica").strip()
+        regla["nivel_perfil"] = nivel
+        texto_perfiles = str(r.get("perfiles") or "").strip()
+        lista_perfiles = [p.strip() for p in texto_perfiles.replace(";", ",").split(",")
+                          if p.strip() and p.strip().lower() not in ("nan", "none")]
+        regla["perfiles"] = lista_perfiles
+        campo_nivel = {"departamento": "departamentos", "clase": "clases",
+                       "familia": "familias"}.get(nivel)
+        if campo_nivel and lista_perfiles:
+            regla[campo_nivel] = lista_perfiles
         out[nombre] = regla
     return out
 
@@ -1050,9 +1079,8 @@ def _reglas_zona_desde_tabla(edit):
 st.session_state.setdefault("reglas_zona", {})
 _zonas_layout = st.session_state["zonas_layout"]
 
-with st.expander(
-        "Configurar y optimizar las zonas",
-        expanded=bool(_zonas_layout) and not st.session_state["slots"]):
+with st.container(border=True):
+    st.markdown("#### Configuración unificada de zonas")
     if not _zonas_layout:
         st.info(
             "Todavía no hay zonas. Dibújalas en el editor CAD de arriba o "
@@ -1062,10 +1090,12 @@ with st.expander(
             "la nave.")
     else:
         st.caption(
-            "Cada zona se resuelve como un problema propio. En **Pasillos** "
+            "Cada fila concentra mercancía, nivel de perfil, estructura, tipos, "
+            "pasillos y orientación. En **Pasillos** "
             "elige si debe llevarlos, omitirlos o evaluar ambos; en "
-            "**Orientación** puedes fijar una dirección o dejar que el motor "
-            "pruebe horizontal y vertical.")
+            "**Orientación** define la dirección de las hileras en el plano: "
+            "puedes fijarla o dejar que el motor pruebe horizontal y vertical. "
+            "La rotación de la pieza dentro de X/Y/Z ya quedó resuelta arriba.")
         _zf_disponibles = sorted(
             df.get("zona_fisica", pd.Series(dtype=str))
             .dropna().astype(str).str.upper().unique()) if len(df) else []
@@ -1081,6 +1111,21 @@ with st.expander(
         _seed = _reglas_zona_seed(_zonas_layout,
                                   _reglas_semilla,
                                   float(pasillo), orientacion)
+        _rec_nivel = (_analisis_granularidad.get("por_zona", pd.DataFrame())
+                      .set_index("zona_fisica")["nivel_recomendado"].to_dict()
+                      if not _analisis_granularidad.get(
+                          "por_zona", pd.DataFrame()).empty else {})
+        for _idx, _fila in _seed.iterrows():
+            _perfiles_zf = [p.strip().upper() for p in str(
+                _fila.get("zonas_fisicas") or "").split(",") if p.strip()]
+            if len(_perfiles_zf) == 1:
+                _zf = _perfiles_zf[0]
+                _seed.at[_idx, "estructura"] = str(
+                    _estructuras_por_zf.get(_zf, {}).get(
+                        "tipo_estructura", "PISO"))
+                if _fila.get("nivel_perfil") == "area_fisica":
+                    _seed.at[_idx, "nivel_perfil"] = _rec_nivel.get(
+                        _zf, "area_fisica")
         _edit = st.data_editor(
             _seed, width="stretch", hide_index=True, num_rows="fixed",
             key=f"reglas_zona_editor_{st.session_state['zonas_layout_rev']}",
@@ -1091,6 +1136,21 @@ with st.expander(
                     help="Orden en que se resuelven. La mercancía que ya cabe "
                          "en una zona no vuelve a pedir espacio en la "
                          "siguiente."),
+                "zonas_fisicas": st.column_config.TextColumn(
+                    "Mercancía / zona física",
+                    help="Perfil físico principal: MOTOS, PISO, RACK, etc. "
+                         "Al elegirlo se heredan su estructura y tipos dimensionados."),
+                "nivel_perfil": st.column_config.SelectboxColumn(
+                    "Definir por", options=["area_fisica", "departamento", "clase", "familia"],
+                    help="Usa la recomendación del análisis. Baja de nivel solo "
+                         "si necesitas reservar perfiles separados."),
+                "perfiles": st.column_config.TextColumn(
+                    "Valores admitidos",
+                    help="Departamentos, clases o familias separados por coma; "
+                         "vacío admite todos dentro de la mercancía elegida."),
+                "estructura": st.column_config.TextColumn(
+                    "Estructura", disabled=True,
+                    help="Se hereda de la mercancía para mantener coherencia con X/Y/Z."),
                 "modo_pasillo": st.column_config.SelectboxColumn(
                     "Pasillos", options=["auto", "con", "sin"],
                     help="Auto evalúa con y sin pasillos. Usa 'con' cuando "
@@ -1106,12 +1166,6 @@ with st.expander(
                     "Margen (m)", min_value=0.0, max_value=5.0, step=0.1,
                     format="%.2f",
                     help="Holgura contra el borde de la zona."),
-                "zonas_fisicas": st.column_config.TextColumn(
-                    "Mercancía que admite",
-                    help="Zonas físicas de origen, separadas por coma. Si el "
-                         "área tiene el mismo nombre, se vincula automáticamente."),
-                "familias": st.column_config.TextColumn(
-                    "Familias que admite", help="Separadas por coma."),
                 "tipos": st.column_config.TextColumn(
                     "Tipos de localidad",
                     help="Se completan desde el cálculo por mercancía. Puedes "
@@ -1215,64 +1269,7 @@ with st.expander(
                 + ". Revisa sus reglas: un filtro de mercancía muy estrecho o "
                 "un pasillo ancho en una zona angosta la dejan vacía.")
 
-with st.expander("Avanzado · Optimizar todo con una sola regla",
-                 expanded=False):
-    st.caption(
-        "Alternativa para tratar toda la nave con la misma orientación y el "
-        "mismo esquema de pasillos. Si definiste zonas, usa preferentemente "
-        "el optimizador anterior. Este modo genera alternativas con diferente "
-        "número de tipos y orientación. El "
-        "orden de decisión es: cumplir cobertura, usar menos m² y después "
-        "reducir la distancia estimada al andén. La distancia final se valida "
-        "en Evaluar y decidir.")
-    oc1, oc2, oc3, oc4 = st.columns(4)
-    opt_tipos = oc1.number_input("Máx. tipos", 1, 8, 5, 1, key="opt_tipos")
-    opt_cobertura = oc2.number_input("Cobertura mínima (%)", 0.0, 100.0, 100.0,
-                                     1.0, key="opt_cobertura")
-    opt_dx = oc3.number_input("Andén X (m)", 0.0, float(ancho), 0.0, 0.5,
-                              key="opt_depot_x")
-    opt_dy = oc4.number_input("Andén Y (m)", 0.0, float(largo), 0.0, 0.5,
-                              key="opt_depot_y")
-    if st.button("Generar mejor alternativa", type="primary", width='stretch'):
-        with st.spinner("Generando y evaluando alternativas…"):
-            st.session_state["optimizacion_layout"] = S.optimizar_layout(
-                df_viable, cfg, pasillo_m=pasillo, max_tipos=int(opt_tipos),
-                cobertura_min=float(opt_cobertura), depot_x=float(opt_dx),
-                depot_y=float(opt_dy), obstaculos=st.session_state["obstaculos"])
-    resultado_opt = st.session_state.get("optimizacion_layout", {})
-    alternativas = resultado_opt.get("alternativas", [])
-    if resultado_opt.get("skus_pendientes_dimension"):
-        st.warning(f"El ranking excluye {resultado_opt['skus_pendientes_dimension']} SKU(s) "
-                   "sin dimensiones físicas válidas; su inventario reduce la cobertura total.")
-    if resultado_opt and not alternativas:
-        st.error("No hay SKUs con dimensiones válidas para generar una alternativa.")
-    if alternativas:
-        ranking = pd.DataFrame([{
-            "rango": a["rango"], "alternativa": a["id"],
-            "recomendada": "✓" if a["recomendada"] else "",
-            "tipos": a["n_tipos"], "orientación": a["orientacion"],
-            "cobertura %": a["cobertura_pct"], "m²": a["m2_ubicaciones"],
-            "distancia estimada (m)": a["distancia_estimada_m"],
-            "SKU sin ubicar": a["skus_sin_ubicar"],
-        } for a in alternativas])
-        st.dataframe(ranking, width='stretch', hide_index=True)
-        elegida_id = st.selectbox("Alternativa a previsualizar/aplicar",
-                                  [a["id"] for a in alternativas],
-                                  format_func=lambda x: f"{x}"
-                                  + " · recomendada" if next(a for a in alternativas if a["id"] == x)["recomendada"]
-                                  else x)
-        elegida = next(a for a in alternativas if a["id"] == elegida_id)
-        if st.button("✅ Aplicar alternativa seleccionada", width='stretch'):
-            st.session_state["slots"] = elegida["slots"]
-            st.session_state["tipos_catalogo"] = elegida["tipos"]
-            st.session_state["prop_resumen"] = elegida["resumen"]
-            st.session_state["slots_rev"] += 1
-            st.session_state["tipos_rev"] = st.session_state.get("tipos_rev", 0) + 1
-            _precargar_grid(elegida["slots"], elegida["orientacion"], _catalogo())
-            st.rerun()
-
-
-st.subheader("4 · Revisar el resultado")
+st.subheader("3 · Revisar el resultado")
 st.caption("Comprueba cobertura y espacio, revisa el plano y ajusta sólo las "
            "excepciones antes de pasar a Evaluar y decidir.")
 

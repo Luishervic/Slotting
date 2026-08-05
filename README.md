@@ -64,8 +64,11 @@ Flujo de usuario:
 
 1. **Inicio:** muestra el avance y lleva automáticamente al siguiente paso.
 2. **Datos y alcance:** elegir zona física, validar y confirmar los SKU.
-3. **Diseñar layout:** importar el plano CAD o dibujarlo, generar las
-   ubicaciones y revisar el acomodo en 2D y 3D.
+3. **Diseñar almacén:** analizar primero la mercancía para estandarizar los
+   tipos de localidad X/Y/Z; después importar o dibujar el plano y declarar en
+   cada zona mercancía, estructura, pasillos, orientación y restricciones.
+   Por último se calcula cuántas localidades necesita cada SKU y se genera el
+   libro de preparación para que el usuario decida el acomodo y lo reimporte.
 4. **Operación y métodos:** simular el surtido sobre ese layout, comparar
    métodos —discreto, lotes, cluster, zonas, oleadas—, animar los mejores y
    medir la interferencia entre operadores.
@@ -83,6 +86,43 @@ guardado de escenarios muestran un diálogo con el impacto antes de ejecutarse.
 
 **Calidad de datos** (`pages/1_Validacion_de_datos.py`) es una herramienta
 auxiliar para revisar valores atípicos, dimensiones y peso antes del diseño.
+
+## Perfiles físicos y tipos de ubicación
+
+`slotting/perfiles_localidad.py` separa explícitamente tres decisiones que no
+deben contaminarse entre sí:
+
+1. **Qué tipos existen.** Se calcula con largo, ancho, alto, rotación permitida
+   y límites de la estructura. Cada SKU pesa una vez; ABC, inventario y demanda
+   no cambian las medidas.
+2. **Cuántas localidades hacen falta.** Se calcula después con inventario,
+   estiba y, opcionalmente, separación de surtido/reserva.
+3. **Dónde se colocan.** ABC y prioridad operativa intervienen aquí, una vez
+   aprobados los tipos y dibujadas las zonas.
+
+Por cada zona física se comparan área, departamento, clase y familia. La
+recomendación conserva el nivel más simple y sólo baja en la jerarquía si la
+categoría reduce materialmente la dispersión tridimensional, tiene muestras
+suficientes y no crea perfiles pequeños. Después genera el menor número de
+tipos estándar —Compacta, Media, Grande y los especiales necesarios— que queda
+cerca de la mejor eficiencia geométrica. X, Y y Z significan exclusivamente
+ancho, fondo y alto útil. Cambiar existencias o ABC no altera esas medidas;
+sólo altera cantidades y posición.
+
+El diseño se divide en tres vistas: análisis de mercancía, restricciones por
+zona y preparación de localidades. El plano es la fuente geométrica. El libro
+XLSX sólo presenta tres hojas al usuario: `Dashboard`, `Tipos_ubicacion` y
+`Mapa_colocacion`. En el mapa se escribe un tipo por ancla —con `|V` para
+girarlo— y el saldo requerido/colocado/restante se actualiza en vivo. Las
+tablas normalizadas de SKU, localidades, relaciones, zonas y validaciones
+permanecen ocultas; al reimportar, la aplicación reconstruye la geometría y
+asigna automáticamente la mercancía compatible con las restricciones del CAD.
+
+Antes de aplicar el XLSX o ejecutar el motor, `slotting/layout_artifacts.py`
+valida llaves ID/WMS, límites, pertenencia a zona, tipos, obstáculos y
+traslapes. `Mapa_colocacion` es la entrada gráfica del libro; después de
+reimportarlo, la geometría validada regenera un SVG vectorial y un PDF
+imprimible a escala.
 
 ## Importar el plano de la nave
 

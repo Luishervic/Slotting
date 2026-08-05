@@ -483,6 +483,15 @@ def _sku_compatible_con_multisku(
     return compatible
 
 
+def _reserva_admite(reserva, valor) -> bool:
+    """True si una reserva vacía, singular o múltiple admite el valor."""
+    if reserva is None or reserva == "":
+        return True
+    permitidos = reserva if isinstance(reserva, (list, tuple, set)) else [reserva]
+    canon = {str(v).strip().upper() for v in permitidos if str(v).strip()}
+    return not canon or str(valor or "").strip().upper() in canon
+
+
 def distribuir(df_skus: pd.DataFrame, slots: list[dict],
                cfg: SlotConfig | None = None,
                forzados: dict | None = None,
@@ -574,9 +583,7 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
         if clase_sku not in candidatos_por_clase:
             candidatos_por_clase[clase_sku] = [
                 s for s in slots_ord
-                if not s.get("clase_comercial_reservada")
-                or str(s["clase_comercial_reservada"]).strip().upper()
-                == clase_sku
+                if _reserva_admite(s.get("clase_comercial_reservada"), clase_sku)
             ]
         candidatos = candidatos_por_clase[clase_sku]
         # Cursor sobre el prefijo ya cerrado. Una ubicación dedicada se cierra
@@ -609,31 +616,26 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
                 continue
             # Reservas explícitas creadas desde el plano CAD. Son más fuertes
             # que la preferencia global de mantener familias juntas.
-            if (slot.get("familia_reservada")
-                    and str(slot["familia_reservada"]) != str(sku.get("familia", ""))):
+            if not _reserva_admite(slot.get("familia_reservada"),
+                                   sku.get("familia", "")):
+                continue
+            if not _reserva_admite(slot.get("departamento_reservado"),
+                                   sku.get("departamento", "")):
                 continue
             clase_comercial = sku.get("clase_comercial", sku.get("DESCCLASE", ""))
-            if (slot.get("clase_comercial_reservada")
-                    and str(slot["clase_comercial_reservada"]).strip().upper()
-                    != str(clase_comercial).strip().upper()):
+            if not _reserva_admite(slot.get("clase_comercial_reservada"),
+                                   clase_comercial):
                 continue
-            if (slot.get("clase_abc_reservada")
-                    and str(slot["clase_abc_reservada"]).upper()
-                    != str(sku.get("clase_abc", "")).upper()):
+            if not _reserva_admite(slot.get("clase_abc_reservada"),
+                                   sku.get("clase_abc", "")):
                 continue
             # Zona física de ORIGEN de la mercancía. Con un alcance que mezcla
             # varias zonas —piso y rack en el mismo espacio, por ejemplo— hace
             # falta poder decir qué admite cada área del layout; sin esto, un
             # área reservada a una zona recibía mercancía de cualquier otra.
-            reserva_zf = slot.get("zona_fisica_reservada")
-            if reserva_zf:
-                permitidas = (reserva_zf if isinstance(reserva_zf, (list, tuple, set))
-                              else [reserva_zf])
-                permitidas = {str(z).strip().upper() for z in permitidas
-                              if str(z).strip()}
-                if permitidas and str(
-                        sku.get("zona_fisica", "")).strip().upper() not in permitidas:
-                    continue
+            if not _reserva_admite(slot.get("zona_fisica_reservada"),
+                                   sku.get("zona_fisica", "")):
+                continue
             if (cfg.respetar_zona and slot.get("zona")
                     and str(slot["zona"]) != str(sku.get("zona_propuesta"))):
                 continue
@@ -1151,13 +1153,15 @@ def calcular_tipos_optimos(df, n_tipos: int = 4, gap_m: float = 0.03,
     return tipos
 
 
-def _elegir_tipo(pw: float, pdd: float, tipos_ord: list[dict], gap_m: float) -> str:
+def _elegir_tipo(pw: float, pdd: float, tipos_ord: list[dict], gap_m: float,
+                 ph: float | None = None) -> str:
     """Elige, de menor a mayor área, el primer tipo donde la pieza quepa
     (al menos 1 carril x 1 de fondo). Si no cabe en ninguno, usa el mayor."""
     for t in tipos_ord:
         lanes = math.floor((t["w"] + 1e-9) / (pw + gap_m))
         deep = math.floor((t["d"] + 1e-9) / (pdd + gap_m))
-        if lanes >= 1 and deep >= 1:
+        cabe_alto = ph is None or not t.get("h") or ph <= float(t["h"]) + 1e-9
+        if lanes >= 1 and deep >= 1 and cabe_alto:
             return t["codigo"]
     return tipos_ord[-1]["codigo"]
 
@@ -1220,9 +1224,10 @@ def proponer_layout_racks(
     l = pd.to_numeric(d["largo_cm"], errors="coerce") / 100
     a = pd.to_numeric(d["ancho_cm"], errors="coerce") / 100
     d["pw"], d["pd"] = np.minimum(l, a), np.maximum(l, a)
+    d["ph"] = pd.to_numeric(d["alto_cm"], errors="coerce") / 100.0
     tipos_ord = sorted(tipos, key=lambda t: t["w"] * t["d"])
     d["tipo_codigo"] = [
-        _elegir_tipo(r.pw, r.pd, tipos_ord, cfg.gap_m)
+        _elegir_tipo(r.pw, r.pd, tipos_ord, cfg.gap_m, r.ph)
         for r in d.itertuples()
     ]
     if "clase_comercial" not in d:
@@ -1389,10 +1394,13 @@ def _proponer_core(df, cfg: SlotConfig, pasillo_m: float, tipos: list[dict],
     a = pd.to_numeric(d["ancho_cm"], errors="coerce") / 100.0
     d["pw"] = np.minimum(l, a)
     d["pd"] = np.maximum(l, a)
+    d["ph_loc"] = (pd.to_numeric(d["alto_cm"], errors="coerce") / 100.0) * me
 
     tipo_by_code = {str(t["codigo"]): t for t in tipos}
     tipos_ord = sorted(tipos, key=lambda t: t["w"] * t["d"])
-    d["tipo_codigo"] = [_elegir_tipo(r.pw, r.pd, tipos_ord, gap_m) for r in d.itertuples()]
+    d["tipo_codigo"] = [
+        _elegir_tipo(r.pw, r.pd, tipos_ord, gap_m, r.ph_loc)
+        for r in d.itertuples()]
 
     if "clase_comercial" not in d:
         d["clase_comercial"] = pd.NA
@@ -1459,7 +1467,7 @@ def _proponer_core(df, cfg: SlotConfig, pasillo_m: float, tipos: list[dict],
             "clase_comercial": (
                 clase if cfg.agrupar_clase_comercial else pd.NA),
             "tipo_codigo": tcode, "tipo": t.get("tipo", tcode),
-            "w": t["w"], "d": t["d"],
+            "w": t["w"], "d": t["d"], "h": t.get("h"),
             "skus": int(g["sku"].nunique()), "skus_A": int((g["clase_abc"] == "A").sum()),
             "ubic_mono": locs_mono, "ubic_multi": locs_multi,
             "ubicaciones": locs_mono + locs_multi, "cap_loc": cap_loc,
@@ -1495,6 +1503,7 @@ def _proponer_core(df, cfg: SlotConfig, pasillo_m: float, tipos: list[dict],
         clase, tcode = f["clase_comercial"], f["tipo_codigo"]
         w_loc, d_loc = float(f["w"]), float(f["d"])
         niveles_t = tipo_by_code[tcode].get("niveles")
+        alto_t = tipo_by_code[tcode].get("h")
         for multis, cnt in ((False, int(f["ubic_mono"])), (True, int(f["ubic_multi"]))):
             if cnt <= 0:
                 continue
@@ -1533,6 +1542,7 @@ def _proponer_core(df, cfg: SlotConfig, pasillo_m: float, tipos: list[dict],
                             clase if pd.notna(clase) else None),
                         "multisku": multis, "x": round(x, 2), "y": round(y, 2),
                         "w": w_loc, "d": d_loc, "niveles": niveles_t,
+                        "altura_util_nivel_m": alto_t,
                         "prioridad": None, "tipo_codigo": tcode,
                         "zona_layout": zona_fisica.get("nombre") if zona_fisica else None,
                     })
@@ -1654,7 +1664,7 @@ def proponer_layout(df, cfg: SlotConfig, pasillo_m: float = 3.5,
 # se declara hereda el valor general, así que una zona sin reglas se comporta
 # exactamente como antes.
 CAMPOS_REGLA_ZONA = ("pasillo_m", "modo_pasillo", "orientacion", "margen_m", "tipos",
-                     "zonas_fisicas", "familias", "clases", "solo_mono",
+                     "zonas_fisicas", "departamentos", "familias", "clases", "abc", "solo_mono",
                      "solo_multi")
 
 
@@ -1673,13 +1683,15 @@ def _lista(valor) -> list[str]:
 def _catalogo_de_zona(df: pd.DataFrame, regla: dict) -> pd.DataFrame:
     """Mercancía que esta zona admite.
 
-    Filtra por zona física de origen, familia y clase comercial. Un filtro vacío
+    Filtra por zona física de origen, departamento, familia y clase comercial. Un filtro vacío
     significa «cualquiera», que es lo que quiere decir no haber declarado nada.
     """
     d = df
     for campo, columna in (("zonas_fisicas", "zona_fisica"),
+                           ("departamentos", "departamento"),
                            ("familias", "familia"),
-                           ("clases", "clase_comercial")):
+                           ("clases", "clase_comercial"),
+                           ("abc", "clase_abc")):
         permitidos = _lista(regla.get(campo))
         if permitidos and columna in d.columns:
             valores = d[columna].astype("string").str.strip().str.upper()
@@ -1709,8 +1721,11 @@ def _area_zona(zona: dict) -> float:
 def _estructura_para_regla(nombre: str, regla: dict,
                             estructuras: dict | None) -> dict | None:
     """Estructura física que corresponde al perfil admitido por un área."""
+    override = str(regla.get("tipo_estructura") or "").strip().upper()
     if not estructuras:
-        return None
+        return (ST.StructureConfig(
+            zona_fisica=nombre, tipo_estructura=override).to_dict()
+            if override in {"PISO", "RACK"} else None)
     mapa = {str(k).strip().upper(): dict(v)
             for k, v in estructuras.items() if v}
     zonas = _lista(regla.get("zonas_fisicas"))
@@ -1719,7 +1734,9 @@ def _estructura_para_regla(nombre: str, regla: dict,
     candidatas = [mapa[z.strip().upper()] for z in zonas
                   if z.strip().upper() in mapa]
     if not candidatas:
-        return None
+        return (ST.StructureConfig(
+            zona_fisica=nombre, tipo_estructura=override).to_dict()
+            if override in {"PISO", "RACK"} else None)
     firmas = {
         (str(e.get("tipo_estructura", "PISO")).upper(),
          float(e.get("ancho_modulo_m", 0)),
@@ -1731,7 +1748,13 @@ def _estructura_para_regla(nombre: str, regla: dict,
         raise ValueError(
             f"La zona '{nombre}' admite mercancías con estructuras distintas. "
             "Divídela en áreas separadas o deja una sola zona física por área.")
-    return candidatas[0]
+    estructura = dict(candidatas[0])
+    if override in {"PISO", "RACK"}:
+        estructura["tipo_estructura"] = override
+        if override == "PISO":
+            estructura["niveles_rack"] = 1
+            estructura["nivel_manual_hasta"] = 1
+    return estructura
 
 
 def _generar_rack_en_zona(df: pd.DataFrame, cfg: SlotConfig, zona: dict,
@@ -1974,6 +1997,9 @@ def proponer_por_zonas(df: pd.DataFrame, cfg: SlotConfig,
         # empezando en 1 y colisionarían entre sí.
         zf_regla = _lista(regla.get("zonas_fisicas"))
         fam_regla = _lista(regla.get("familias"))
+        dep_regla = _lista(regla.get("departamentos"))
+        clase_regla = _lista(regla.get("clases"))
+        abc_regla = _lista(regla.get("abc"))
         for s in nuevos:
             n_global += 1
             s["id"] = f"{str(cfg.codigo_zona).upper()}-U{n_global:04d}"
@@ -1984,8 +2010,14 @@ def proponer_por_zonas(df: pd.DataFrame, cfg: SlotConfig,
             # mercancía que sus reglas no admiten.
             if zf_regla:
                 s["zona_fisica_reservada"] = zf_regla
-            if len(fam_regla) == 1:
-                s["familia_reservada"] = fam_regla[0]
+            if fam_regla:
+                s["familia_reservada"] = fam_regla
+            if dep_regla:
+                s["departamento_reservado"] = dep_regla
+            if clase_regla:
+                s["clase_comercial_reservada"] = clase_regla
+            if abc_regla:
+                s["clase_abc_reservada"] = abc_regla
         # Las ubicaciones nuevas no pueden encimarse con las de zonas previas:
         # dos zonas dibujadas con un traslape pequeño lo producirían.
         limpios = [s for s in nuevos
