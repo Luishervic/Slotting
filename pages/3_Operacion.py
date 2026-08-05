@@ -1,4 +1,4 @@
-"""Paso 4 — Comparativa de métodos de surtido sobre el layout diseñado.
+"""Paso 3 — Evaluación de métodos de surtido sobre el almacén diseñado.
 
 Responde tres preguntas que se deciden juntas y suelen tratarse por separado:
 
@@ -43,13 +43,13 @@ st.set_page_config(page_title="Operación | Slotting",
                    page_icon="🏁", layout="wide")
 navegacion("operacion")
 titulo_pagina(
-    "Paso 3 de 4",
-    "Operación y métodos de surtido",
-    "Simula el surtido sobre tu layout y compara cómo organizar el trabajo.",
+    "Paso 3 de 3",
+    "Evaluar y decidir",
+    "Configura una corrida, compara alternativas y entiende la recomendación.",
 )
 
 if "df" not in st.session_state:
-    st.warning("Primero carga y confirma los artículos en **📦 Datos y alcance**.")
+    st.warning("Primero carga y confirma los artículos en **📦 Datos y demanda**.")
     st.stop()
 
 df = st.session_state.get("df_escenario", st.session_state["df"])
@@ -95,7 +95,7 @@ def _layout_vivo():
 
 res = _layout_vivo()
 if res is None:
-    st.info("Aún no hay un layout que comparar. Ve a **🗺️ Diseñar layout**, "
+    st.info("Aún no hay un diseño que comparar. Ve a **🗺️ Diseñar almacén**, "
             "genera tus ubicaciones y regresa aquí.")
     st.stop()
 
@@ -112,39 +112,81 @@ c4.metric("Pasillos detectados", f"{len(topo.pasillos)}",
 
 if not topo.confiable:
     st.warning(
-        "El layout no expone pasillos paralelos reconocibles. Las políticas de "
-        "recorrido por pasillo y los cortes de zona se apoyarán en la geometría "
-        "cruda, y algunos resultados pueden no corresponder a la operación real."
-        + ("  \n· " + "  \n· ".join(topo.avisos) if topo.avisos else ""))
+        "La geometría no contiene pasillos paralelos confiables. Algunas "
+        "comparaciones de ruta pueden no representar la operación real."
+    )
+    with st.expander("Ver diagnóstico de la geometría", expanded=False):
+        st.write(
+            "Las políticas por pasillo y los cortes de zona necesitan una "
+            "topología reconocible. Revisa el plano antes de tomar una decisión."
+        )
+        for aviso in topo.avisos:
+            st.markdown(f"- {aviso}")
 
 
 # --------------------------------------------------------------------------- #
-# Parámetros
+# Configuración de la corrida. La barra lateral queda reservada a navegación y
+# contexto; todos los supuestos viven junto al resultado que afectan.
 # --------------------------------------------------------------------------- #
-with st.sidebar:
-    st.header("Demanda")
-    fuente = st.radio(
-        "Origen de los pedidos", ["historico", "csv", "sintetica"],
-        format_func={"historico": "📚 Histórico del CEDIS",
-                     "csv": "📄 Archivo de salidas (CSV)",
-                     "sintetica": "🧪 Sintética (por clase ABC)"}.get,
-        key="fuente_demanda_comparativa",
-        help="El histórico es la única fuente con la que la comparativa es "
-             "defendible: trae el tamaño y la mezcla reales de los pedidos.")
-    n_muestra = st.slider("Recorridos a simular", 40, 800, 200, 20,
-                          help="Cada corrida del barrido cuesta proporcional "
-                               "a esto. 200 da una señal estable.")
-    if fuente == "sintetica":
-        lineas_media = st.slider("Líneas por pedido (media)",
-                                 1.0, 15.0, 4.0, 0.5)
-        unid_media = st.slider("Unidades por línea (media)",
-                               1.0, 10.0, 1.0, 0.5)
-
-    # Todos los parámetros de operación viven en un solo lugar y se comparten
-    # con el resto de la aplicación: capturarlos aquí los deja capturados
-    # en cualquier otra vista que simule.
-    _par = PAR.panel_operacion(cfg_aco, con_interferencia=True,
-                               con_metodo=True)
+with st.expander("1 · Configurar corrida", expanded=True):
+    with st.form("configuracion_operativa", clear_on_submit=False):
+        tab_recomendado, tab_avanzado = st.tabs(
+            ["Recomendado", "Supuestos avanzados"]
+        )
+        with tab_recomendado:
+            st.caption(
+                "Para una primera decisión sólo necesitas elegir la demanda y "
+                "la cuadrilla. El resto parte de supuestos auditables."
+            )
+            fuente = st.segmented_control(
+                "Origen de los pedidos",
+                ["historico", "csv", "sintetica"],
+                default=st.session_state.get(
+                    "fuente_demanda_comparativa", "historico"
+                ),
+                format_func={
+                    "historico": "Histórico del CEDIS",
+                    "csv": "Archivo CSV",
+                    "sintetica": "Demanda sintética",
+                }.get,
+                key="fuente_demanda_comparativa",
+                help="El histórico conserva el tamaño y la mezcla reales de los pedidos.",
+            ) or "historico"
+            basicos = st.columns(3)
+            n_muestra = basicos[0].slider(
+                "Recorridos a simular", 40, 800, 200, 20,
+                help="200 ofrece una primera señal estable."
+            )
+            basicos[1].slider(
+                "Operadores", 1, 40,
+                int(st.session_state.get("op_operadores", 8)), 1,
+                key="op_operadores",
+            )
+            basicos[2].number_input(
+                "Horas por turno", 1.0, 24.0,
+                float(st.session_state.get("op_horas_turno", 8.0)), 0.5,
+                key="op_horas_turno",
+            )
+            if fuente == "sintetica":
+                sint = st.columns(2)
+                lineas_media = sint[0].slider(
+                    "Líneas por pedido (media)", 1.0, 15.0, 4.0, 0.5
+                )
+                unid_media = sint[1].slider(
+                    "Unidades por línea (media)", 1.0, 10.0, 1.0, 0.5
+                )
+        with tab_avanzado:
+            st.caption(
+                "Ajusta estos supuestos sólo cuando tengas mediciones de piso "
+                "o quieras realizar sensibilidad."
+            )
+            _par = PAR.panel_operacion(
+                cfg_aco, con_interferencia=True, con_metodo=True,
+                mostrar_cuadrilla=False,
+            )
+        st.form_submit_button(
+            "Aplicar configuración", type="primary", width="stretch"
+        )
 
 cfg_sim = SIM.SimConfig(**{**_par["sim"].__dict__,
                           "n_pedidos": int(n_muestra),
@@ -303,7 +345,7 @@ if not _cruce:
         f"Ninguno de los {len(_skus_demanda):,} SKU de la demanda está ubicado "
         f"en este layout ({len(_skus_layout):,} SKU acomodados). Revisa que la "
         "zona física elegida sea la misma del maestro cargado en **Datos y "
-        "alcance**.")
+        "demanda**.")
     st.stop()
 if len(_cruce) < 0.5 * len(_skus_demanda):
     st.warning(
@@ -316,9 +358,17 @@ st.caption(f"**{len(pedidos):,} recorridos** · {n_lineas:,} líneas · "
            f"{origen_txt}\n\n{PAR.resumen_operacion(cfg_sim)}")
 
 # --------------------------------------------------------------------------- #
-t_comp, t_anim, t_ruta, t_curva, t_zonas, t_int, t_ref = st.tabs([
-    "🏁 Comparativa", "🎬 Animación", "🗺️ Recorridos",
-    "📈 Cuadrilla", "🧩 Zonas", "🚧 Interferencia", "📚 Referencia"])
+tab_resultado, tab_visual, tab_capacidad = st.tabs([
+    "🏁 Recomendación", "🗺️ Visualizar", "📈 Capacidad y riesgos"
+])
+with tab_resultado:
+    t_comp, t_ref = st.tabs(["Comparativa", "Ayuda de métodos"])
+with tab_visual:
+    t_anim, t_ruta = st.tabs(["Animación", "Recorridos"])
+with tab_capacidad:
+    t_curva, t_zonas, t_int = st.tabs(
+        ["Cuadrilla", "Zonas", "Interferencia"]
+    )
 
 # --------------------------------------------------------------------------- #
 with t_ref:
@@ -378,21 +428,55 @@ with t_ref:
 with t_comp:
     izq, der = st.columns([2, 1])
     with der:
-        st.markdown("**Qué barrer**")
-        metodos_sel = st.multiselect(
-            "Métodos", MT.ORDEN_METODOS, default=MT.ORDEN_METODOS,
-            format_func=lambda m: MT.METODOS[m]["nombre"])
-        zonif_sel = st.multiselect(
-            "Cortes de zona", [z for z in ZN.ORDEN_ESTRATEGIAS
-                               if z != "sin_zonas"],
-            default=["pasillo", "pasillo_balance", "bloque_balance"],
-            format_func=lambda z: ZN.ESTRATEGIAS[z]["nombre"])
+        st.markdown("**Qué comparar**")
         pol_disp = RT.politicas_aplicables(topo)
-        pol_sel = st.multiselect(
-            "Políticas de recorrido", pol_disp,
-            default=[p for p in ("serpentina", "vecino_mas_cercano",
-                                 "optimizada") if p in pol_disp] or pol_disp[:2],
-            format_func=lambda p: RT.POLITICAS[p]["nombre"])
+        preset = st.selectbox(
+            "Tipo de comparación",
+            ["recomendada", "metodos", "rutas", "personalizada"],
+            format_func={
+                "recomendada": "Recomendada",
+                "metodos": "Sólo métodos de surtido",
+                "rutas": "Sólo políticas de recorrido",
+                "personalizada": "Personalizada",
+            }.get,
+            help="La comparación recomendada prueba alternativas aplicables "
+                 "sin pedirte configurar cada eje.",
+        )
+        if preset == "recomendada":
+            metodos_sel = list(MT.ORDEN_METODOS)
+            zonif_sel = [
+                z for z in ("pasillo_balance", "bloque_balance")
+                if z in ZN.ORDEN_ESTRATEGIAS
+            ] or ["pasillo"]
+            pol_sel = [
+                p for p in ("vecino_mas_cercano", "optimizada")
+                if p in pol_disp
+            ] or pol_disp[:1]
+            st.caption("Métodos, cortes balanceados y rutas aplicables.")
+        elif preset == "metodos":
+            metodos_sel = list(MT.ORDEN_METODOS)
+            zonif_sel = ["pasillo_balance"]
+            pol_sel = ["optimizada"] if "optimizada" in pol_disp else pol_disp[:1]
+            st.caption("Mantiene una ruta y cambia la organización del trabajo.")
+        elif preset == "rutas":
+            metodos_sel = ["discreto"]
+            zonif_sel = ["pasillo"]
+            pol_sel = pol_disp
+            st.caption("Mantiene el surtido discreto y cambia sólo el recorrido.")
+        else:
+            metodos_sel = st.multiselect(
+                "Métodos", MT.ORDEN_METODOS, default=MT.ORDEN_METODOS,
+                format_func=lambda m: MT.METODOS[m]["nombre"])
+            zonif_sel = st.multiselect(
+                "Cortes de zona", [z for z in ZN.ORDEN_ESTRATEGIAS
+                                   if z != "sin_zonas"],
+                default=["pasillo_balance", "bloque_balance"],
+                format_func=lambda z: ZN.ESTRATEGIAS[z]["nombre"])
+            pol_sel = st.multiselect(
+                "Políticas de recorrido", pol_disp,
+                default=[p for p in ("vecino_mas_cercano", "optimizada")
+                         if p in pol_disp] or pol_disp[:1],
+                format_func=lambda p: RT.POLITICAS[p]["nombre"])
         n_combos = CM.EjesMetodo(
             metodos=metodos_sel, zonificaciones=zonif_sel or ["pasillo"],
             politicas=pol_sel or ["vecino_mas_cercano"], n_zonas=[n_zonas]

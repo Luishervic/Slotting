@@ -1,28 +1,25 @@
-"""Paso 2 — Diseño de layout automático, edición 2D y vista 3D.
-
-Flujo: el sistema PROPONE tipos de ubicación con el tamaño más conveniente
-para tu inventario (o el usuario los ajusta a mano), acomodados por familia
-con las familias de más SKUs A en las cabeceras; luego se editan con una
-CUADRÍCULA simple tipo hoja de cálculo (copiar/pegar) y se pasa a 3D y a la
-simulación.
-"""
+"""Paso 2 — Capacidad, zonas, optimización de acomodo y revisión."""
 import copy
 import io as _io
 import json
+from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from slotting.engine.registry import get_profile
+from slotting import capacidad_zonas as CZ
 from slotting import cad_import as CAD
+from slotting import structures as ST
 from slotting import viz
 from slotting.cad_editor import editor as editor_cad
 from slotting.drag_editor import editor as editor_arrastre
 from slotting.paths import SCENARIO_DB
 from slotting.scenario_store import ScenarioStore
-from slotting.ui import confirmar_accion, navegacion
+from slotting.ui import confirmar_accion, navegacion, titulo_pagina
 from slotting.geometry import (area_poligono, normalizar_poligono,
                                poligono_contenido, poligono_en_lienzo,
                                poligono_simple, poligonos_se_solapan,
@@ -184,7 +181,11 @@ def _aplicar_tipos_al_layout(slots, catalogo, pasillo_m, orientacion):
 
 st.set_page_config(page_title="Layout", page_icon="🏗️", layout="wide")
 navegacion("diseno")
-st.title("🏗️ Layout del piso")
+titulo_pagina(
+    "Paso 2 de 3",
+    "Diseñar almacén",
+    "Calcula la capacidad, configura las zonas y optimiza su acomodo.",
+)
 
 if "df" not in st.session_state:
     st.warning("Primero carga una sección en la página principal (📦 Slotting).")
@@ -228,38 +229,27 @@ if st.session_state.get("modo2d") not in (
 FAMILIAS = sorted(df_base["familia"].dropna().unique()) if "familia" in df_base else []
 
 # --------------------------------------------------------------------------- #
-# Configuración (una sola vez, en la barra lateral)
+# Objetivo confirmado en Datos y configuración general del diseño.
 # --------------------------------------------------------------------------- #
-with st.sidebar:
-    st.header("Escenario de inventario")
-    columnas_unidades = [c for c in df_base.columns
-                          if pd.api.types.is_numeric_dtype(df_base[c])]
-    candidatos_objetivo = [c for c in columnas_unidades
-                            if any(t in c.lower() for t in ("objetivo", "target", "politica"))]
-    columna_base_def = "unidades" if "unidades" in columnas_unidades else columnas_unidades[0]
-    etiqueta_escenario = st.selectbox(
-        "Escenario", ["Existencia actual", "Política objetivo", "Pico estacional", "Personalizado"],
-        key="escenario_nombre")
-    col_def = (candidatos_objetivo[0] if etiqueta_escenario == "Política objetivo"
-               and candidatos_objetivo else columna_base_def)
-    col_unidades = st.selectbox(
-        "Columna de unidades", columnas_unidades,
-        index=columnas_unidades.index(st.session_state.get("escenario_columna", col_def))
-        if st.session_state.get("escenario_columna", col_def) in columnas_unidades
-        else columnas_unidades.index(col_def),
-        key="escenario_columna",
-        help="Para una política objetivo por SKU selecciona su columna real; "
-             "el factor sirve para un supuesto de estacionalidad.")
-    factor_def = 1.0 if etiqueta_escenario in ("Existencia actual", "Política objetivo") else 1.25
-    factor_escenario = st.number_input(
-        "Factor sobre la columna", 0.0, 10.0,
-        float(st.session_state.get("escenario_factor", factor_def)), 0.05,
-        key="escenario_factor",
-        help="Pico estacional: por ejemplo 1.25 equivale a 25% adicional. "
-             "Para una política objetivo por SKU normalmente debe ser 1.00.")
-    st.caption("La corrida identificará este escenario; las versiones y la "
-               "comparación se agregarán en la fase posterior.")
-    st.info("Las dimensiones, perímetro, obstáculos y accesos se definen en **Plano CAD**. Aquí sólo se configuran escenario y reglas de acomodo.")
+columnas_unidades = [
+    c for c in df_base.columns if pd.api.types.is_numeric_dtype(df_base[c])
+]
+columna_base_def = "unidades" if "unidades" in columnas_unidades else columnas_unidades[0]
+etiqueta_escenario = st.session_state.get("escenario_nombre", "Existencia actual")
+col_unidades = st.session_state.get("escenario_columna", columna_base_def)
+if col_unidades not in columnas_unidades:
+    col_unidades = columna_base_def
+factor_escenario = float(st.session_state.get("escenario_factor", 1.0))
+
+st.caption(
+    f"Objetivo: **{etiqueta_escenario}** · {col_unidades} × "
+    f"{factor_escenario:.2f}. Para cambiarlo vuelve a **Datos y demanda**."
+)
+with st.expander("0 · Reglas generales del diseño", expanded=True):
+    st.caption(
+        "Estas reglas se aplican a todo el almacén. Las excepciones por zona "
+        "se configuran junto a la generación de ubicaciones."
+    )
     # Respaldo tabular para recuperar un plano existente; la edición normal se
     # realiza en el CAD para no duplicar flujos.
     largo = float(st.session_state["largo_m"])
@@ -380,43 +370,69 @@ with st.sidebar:
                 st.session_state["zonas_layout"] = candidatas
                 st.session_state["zonas_layout_rev"] += 1
                 st.rerun()
-    pasillo = st.slider("Pasillo entre filas (m)", 1.0, 6.0, 3.5, 0.1)
-    altura = st.slider("Altura libre a techo (m)", 2.0, 14.0, 8.0, 0.5)
-    orientacion = st.radio(
-        "Orientación de pasillos", ["horizontal", "vertical"],
-        format_func={"horizontal": "↔️ Horizontal (filas)",
-                     "vertical": "↕️ Vertical (columnas)"}.get,
-        horizontal=True, key="orientacion_pasillo",
-        help="Horizontal: los pasillos separan filas apiladas de arriba a "
-             "abajo. Vertical: los pasillos separan columnas apiladas de "
-             "izquierda a derecha (todo el acomodo gira 90°).")
-    st.header("Reglas de acomodo")
-    umbral_viable = st.number_input(
-        "Mínimo de unidades para acomodo dedicado", 1, 500, 10, 1,
-        help="SKUs con MENOS unidades que esto no reciben ubicación propia en "
-             "el piso principal: se agrupan en la 🗃️ Zona especial (más abajo), "
-             "con su propia área y ubicaciones compartidas.")
-    resp_fam = st.toggle("Familias juntas (respetar familia)", value=True)
-    max_skus_multi = st.slider(
-        "Máx. SKUs por ubicación multi-SKU", 0, 30, 0, 1,
-        help="Tope de SKUs DISTINTOS que puede contener una ubicación "
-             "multi-SKU (0 = sin límite). Al llegar al tope, los siguientes "
-             "SKUs buscan otra ubicación. Aplica al piso principal y a la "
-             "🗃️ Zona especial.")
     ORDEN_LABELS = {"clase_abc": "Clase (ABC)", "dcf": "DCF",
                     "familia": "Familia", "volumen": "Volumen",
                     "unidades": "Inventario"}
-    orden_sel = st.multiselect(
-        "Prioridad de surtido (el 1º manda)", list(ORDEN_LABELS),
-        default=["clase_abc", "unidades"], format_func=ORDEN_LABELS.get)
-    st.header("Sobre-stock")
-    umbral_rep = st.number_input(
-        "Marcar SKU repartido en ≥ (ubicaciones)", 2, 100, 2, 1,
-        key="umbral_repartido",
-        help="Resalta en ámbar las ubicaciones de SKUs que ocupan este número "
-             "de ubicaciones o más (posible sobre-stock). Abajo de los KPIs "
-             "puedes limitarlos: conservan (umbral − 1) ubicaciones en el "
-             "piso y solo su excedente va a la 🗃️ Zona especial.")
+    modo_diseno = st.segmented_control(
+        "Nivel de configuración",
+        ["recomendado", "personalizado"],
+        default=st.session_state.get("modo_config_diseno", "recomendado"),
+        format_func={
+            "recomendado": "Recomendado",
+            "personalizado": "Personalizado",
+        }.get,
+        key="modo_config_diseno",
+    ) or "recomendado"
+    if modo_diseno == "recomendado":
+        pasillo = 3.5
+        altura = 8.0
+        orientacion = "horizontal"
+        st.session_state["orientacion_pasillo"] = orientacion
+        umbral_viable = 10
+        resp_fam = True
+        max_skus_multi = 0
+        orden_sel = ["clase_abc", "unidades"]
+        umbral_rep = 2
+        st.info(
+            "Perfil equilibrado: pasillo 3.5 m, altura 8 m, familias juntas "
+            "y prioridad ABC + inventario. Usa Personalizado sólo si estas "
+            "condiciones no representan la operación."
+        )
+    else:
+        fisica_1, fisica_2 = st.columns(2)
+        pasillo = fisica_1.slider(
+            "Pasillo entre filas (m)", 1.0, 6.0, 3.5, 0.1
+        )
+        altura = fisica_2.slider(
+            "Altura libre a techo (m)", 2.0, 14.0, 8.0, 0.5
+        )
+        orientacion = st.radio(
+            "Orientación de pasillos", ["horizontal", "vertical"],
+            format_func={"horizontal": "Horizontal (filas)",
+                         "vertical": "Vertical (columnas)"}.get,
+            horizontal=True, key="orientacion_pasillo",
+            help="La orientación gira 90° todo el acomodo propuesto.")
+        reglas_1, reglas_2 = st.columns(2)
+        umbral_viable = reglas_1.number_input(
+            "Mínimo para acomodo dedicado", 1, 500, 10, 1,
+            help="Los SKU por debajo del umbral pasan a consolidación."
+        )
+        resp_fam = reglas_2.toggle(
+            "Mantener familias juntas", value=True
+        )
+        max_skus_multi = reglas_1.slider(
+            "Máx. SKU por ubicación compartida", 0, 30, 0, 1,
+            help="0 significa sin límite."
+        )
+        umbral_rep = reglas_2.number_input(
+            "Marcar SKU repartido desde", 2, 100, 2, 1,
+            key="umbral_repartido",
+        )
+        orden_sel = st.multiselect(
+            "Prioridad de surtido", list(ORDEN_LABELS),
+            default=["clase_abc", "unidades"],
+            format_func=ORDEN_LABELS.get,
+        )
 
 # La columna original se conserva intacta. Todas las reglas de slotting usan
 # esta copia para que cada escenario sea reproducible y no altere el dataset.
@@ -429,9 +445,136 @@ st.session_state["meta_escenario"] = {
     "factor": float(factor_escenario),
 }
 
-st.subheader("1 · El plano")
-st.caption("Importa el plano de arquitectura o dibuja el contorno a mano. "
-           "De aquí salen el área operativa, las zonas, las columnas y el andén.")
+cfg = S.SlotConfig(largo_m=largo, ancho_m=ancho,
+                   orden=orden_sel or ["clase_abc", "unidades"],
+                   altura_libre_m=altura, respetar_familia=resp_fam,
+                   multisku_max_unidades=int(umbral_viable),
+                   multisku_max_skus=int(max_skus_multi) or None,
+                   perimetro=normalizar_poligono(st.session_state["perimetro"]),
+                   zonas=[dict(z) for z in st.session_state["zonas_layout"]])
+
+# El alcance de capacidad se calcula antes del plano: primero se determina lo
+# que el inventario necesita y después se comprueba cómo cabe en cada zona.
+_unid = df.get("unidades", 0).fillna(0)
+_sku_str = df["sku"].astype(str)
+_sobrestock = set(st.session_state.get("skus_sobrestock", []))
+df_viable_base = df[_unid >= umbral_viable]
+df_viable = S.filtrar_dimensiones_validas(df_viable_base)
+df_especial_base = S.filtrar_dimensiones_validas(
+    df[(_unid > 0) & (_unid < umbral_viable)])
+_skus_dim_pend = int(df_viable_base["sku"].astype(str).nunique()
+                      - df_viable["sku"].astype(str).nunique())
+_max_ubic = {s: max(1, int(umbral_rep) - 1) for s in _sobrestock}
+st.session_state["max_ubic_sobrestock"] = _max_ubic
+
+st.subheader("1 · Calcular localidades")
+st.caption(
+    "Cada zona física recibe sus propios tipos de localidad según su mercancía "
+    "y estructura. Primero se calcula la necesidad; el plano sólo determina "
+    "después cómo acomodarla.")
+cap1, cap2, cap3 = st.columns([1, 1.4, 1.6])
+_max_tipos_zona = cap1.number_input(
+    "Máx. tipos por zona", 1, 8, 4, 1, key="max_tipos_por_zona",
+    help="El sistema puede elegir menos si el ahorro adicional no compensa "
+         "la fragmentación operativa.")
+_modo_capacidad = cap2.segmented_control(
+    "Inventario a dimensionar", ["total", "frente_reserva"], default="total",
+    format_func={"total": "Todo junto",
+                 "frente_reserva": "Separar surtido y reserva"}.get,
+    key="modo_capacidad_zonas") or "total"
+_recalcular_capacidad = cap3.button(
+    "Calcular por zona física", type="primary", width="stretch")
+
+_ruta_estructuras = (st.session_state.get("cedis_archivos") or {}).get(
+    "estructuras")
+_estructuras = ST.cargar_catalogo(Path(_ruta_estructuras)) \
+    if _ruta_estructuras else pd.DataFrame()
+_zonas_fisicas_capacidad = sorted(
+    df_viable.get("zona_fisica", pd.Series(dtype=str))
+    .dropna().astype(str).str.strip().str.upper().unique())
+_estructuras_por_zf = {
+    zona: ST.configuracion_zona(_estructuras, zona).to_dict()
+    for zona in _zonas_fisicas_capacidad
+}
+_firma_capacidad = (
+    st.session_state.get("fuente_firma"), etiqueta_escenario, col_unidades,
+    float(factor_escenario), int(_max_tipos_zona), _modo_capacidad,
+    int(umbral_viable))
+if (_recalcular_capacidad
+        or st.session_state.get("firma_capacidad_zonas") != _firma_capacidad):
+    if not df_viable.empty:
+        with st.spinner("Calculando tipos, localidades y módulos por zona…"):
+            st.session_state["capacidad_zonas"] = CZ.calcular_capacidad_por_zona_fisica(
+                df_viable, _estructuras, cfg,
+                max_tipos=int(_max_tipos_zona),
+                modo_inventario=_modo_capacidad,
+                tolerancia_complejidad_pct=3.0,
+                umbral_multisku=int(umbral_viable),
+                engine_profile=st.session_state.get(
+                    "cedis_engine_profile", "default"))
+        st.session_state["firma_capacidad_zonas"] = _firma_capacidad
+        st.session_state["tipos_catalogo"] = st.session_state[
+            "capacidad_zonas"]["tipos"]
+        st.session_state["n_tipos"] = int(_max_tipos_zona)
+        st.session_state["tipos_rev"] = st.session_state.get("tipos_rev", 0) + 1
+
+_capacidad_zonas = st.session_state.get("capacidad_zonas", {})
+_tipos_capacidad = [t for t in st.session_state.get("tipos_catalogo", [])
+                    if t.get("w") and t.get("d")]
+if df_viable.empty or not _tipos_capacidad:
+    st.warning("No hay SKU con dimensiones y unidades utilizables para calcular capacidad.")
+else:
+    _tot_cap = _capacidad_zonas["totales"]
+    cm1, cm2, cm3, cm4, cm5 = st.columns(5)
+    cm1.metric("Zonas físicas", _tot_cap["zonas"])
+    cm2.metric("Tipos recomendados", _tot_cap["tipos"])
+    cm3.metric("Localidades lógicas", f"{_tot_cap['localidades']:,}")
+    cm4.metric("Módulos físicos", f"{_tot_cap['modulos']:,}")
+    cm5.metric("Huella neta", f"{_tot_cap['m2']:,.1f} m²",
+               help="Área de estructura; todavía no incluye pasillos.")
+    st.dataframe(
+        _capacidad_zonas["por_zona"], width="stretch", hide_index=True,
+        column_config={
+            "zona_fisica": "Zona física / mercancía",
+            "tipos_recomendados": "Tipos",
+            "localidades_surtido": "Loc. surtido",
+            "localidades_reserva": "Loc. reserva",
+            "localidades_total": "Loc. totales",
+            "modulos_fisicos": "Módulos físicos",
+            "m2_estructura": "Huella neta (m²)",
+            "carga_sin_confirmar": "Carga por confirmar",
+        })
+    _medidas_pend = _capacidad_zonas["por_zona"][
+        ~_capacidad_zonas["por_zona"]["estado_medidas"].eq("CONFIRMADO")]
+    if len(_medidas_pend):
+        st.warning(
+            "Estructuras con medidas pendientes: "
+            + ", ".join(_medidas_pend["zona_fisica"].astype(str))
+            + ". El resultado es preliminar hasta confirmar módulo, altura y carga.")
+    with st.expander("Entender y comparar el cálculo", expanded=False):
+        st.caption(
+            "La alternativa seleccionada es la de menor huella. Si un catálogo "
+            "con menos tipos queda a menos de 3% del mínimo, se prefiere para "
+            "evitar fragmentar el almacén.")
+        st.markdown("**Alternativas evaluadas por zona**")
+        st.dataframe(_capacidad_zonas["alternativas"], width="stretch",
+                     hide_index=True)
+        if not _capacidad_zonas["por_tipo"].empty:
+            st.markdown("**Localidades y módulos por tipo**")
+            st.dataframe(_capacidad_zonas["por_tipo"], width="stretch",
+                         hide_index=True)
+        if not _capacidad_zonas["excepciones"].empty:
+            st.markdown("**SKU que requieren otra estructura o datos**")
+            st.dataframe(_capacidad_zonas["excepciones"], width="stretch",
+                         hide_index=True)
+    st.caption(
+        f"Este cálculo cubre el piso principal (SKU con al menos "
+        f"{int(umbral_viable)} unidades). La baja rotación continúa en la "
+        "zona especial de consolidación.")
+
+st.subheader("2 · Configurar las zonas")
+st.caption("Importa el plano o dibuja el contorno, divide el área en zonas y "
+           "marca columnas, restricciones y andenes.")
 
 # --------------------------------------------------------------------------- #
 # Importar el plano de arquitectura
@@ -723,30 +866,6 @@ with st.expander("✏️ Editor CAD del área y ubicaciones", expanded=True):
         st.session_state["perimetro_rev"] += 1
         st.rerun()
 
-cfg = S.SlotConfig(largo_m=largo, ancho_m=ancho,
-                   orden=orden_sel or ["clase_abc", "unidades"],
-                   altura_libre_m=altura, respetar_familia=resp_fam,
-                   multisku_max_unidades=int(umbral_viable),
-                   multisku_max_skus=int(max_skus_multi) or None,
-                   perimetro=normalizar_poligono(st.session_state["perimetro"]),
-                   zonas=[dict(z) for z in st.session_state["zonas_layout"]])
-
-# SKUs "viables" (>= mínimo) van al piso principal, dedicados; el resto
-# (unidades > 0 pero por debajo del mínimo) se manda a la Zona especial.
-# Los SKUs marcados por SOBRE-STOCK se quedan en el piso pero con TOPE de
-# (umbral - 1) ubicaciones; solo su EXCEDENTE se agrega a la zona especial.
-_unid = df.get("unidades", 0).fillna(0)
-_sku_str = df["sku"].astype(str)
-_sobrestock = set(st.session_state.get("skus_sobrestock", []))
-df_viable_base = df[_unid >= umbral_viable]
-df_viable = S.filtrar_dimensiones_validas(df_viable_base)
-df_especial_base = S.filtrar_dimensiones_validas(
-    df[(_unid > 0) & (_unid < umbral_viable)])
-_skus_dim_pend = int(df_viable_base["sku"].astype(str).nunique()
-                      - df_viable["sku"].astype(str).nunique())
-_max_ubic = {s: max(1, int(umbral_rep) - 1) for s in _sobrestock}
-st.session_state["max_ubic_sobrestock"] = _max_ubic
-
 # --------------------------------------------------------------------------- #
 # Continuidad tras importar un plano
 # --------------------------------------------------------------------------- #
@@ -760,18 +879,34 @@ if st.session_state.pop("importar_generar_ubicaciones", False):
         st.warning(
             "El plano se importó, pero ningún SKU del alcance tiene "
             "dimensiones y unidades utilizables, así que no se pudieron "
-            "generar ubicaciones. Revisa **Datos y alcance** y vuelve a "
+            "generar ubicaciones. Revisa **Datos y demanda** y vuelve a "
             "generarlas con **Calcular dimensiones óptimas**.")
     else:
-        tipos_auto = S.calcular_tipos_optimos(
-            df_viable, n_tipos=int(st.session_state.get("n_tipos", 4)))
+        tipos_auto = [t for t in st.session_state.get("tipos_catalogo", [])
+                      if t.get("w") and t.get("d")]
+        if not tipos_auto:
+            tipos_auto = S.calcular_tipos_optimos(
+                df_viable, n_tipos=int(st.session_state.get("n_tipos", 4)))
         st.session_state["tipos_catalogo"] = tipos_auto
         st.session_state["tipos_rev"] = st.session_state.get("tipos_rev", 0) + 1
-        prop_auto = S.proponer_layout(
-            df_viable, cfg, pasillo_m=pasillo, tipos=tipos_auto,
-            umbral_multisku=int(umbral_viable), max_ubic=_max_ubic,
-            obstaculos=st.session_state["obstaculos"],
-            orientacion_pasillo=orientacion)
+        if cfg.zonas:
+            _reglas_importadas = CZ.vincular_tipos_a_reglas(
+                st.session_state.get("reglas_zona", {}), tipos_auto,
+                [str(z.get("nombre")) for z in cfg.zonas])
+            prop_auto = S.optimizar_por_zonas(
+                df_viable, cfg, tipos=tipos_auto, pasillo_m=pasillo,
+                umbral_multisku=int(umbral_viable), max_ubic=_max_ubic,
+                obstaculos=st.session_state["obstaculos"],
+                reglas=_reglas_importadas, estructuras=_estructuras_por_zf)
+            st.session_state["reparto_zonas"] = prop_auto["por_zona"]
+            st.session_state["alternativas_zona"] = prop_auto[
+                "alternativas_zona"]
+        else:
+            prop_auto = S.proponer_layout(
+                df_viable, cfg, pasillo_m=pasillo, tipos=tipos_auto,
+                umbral_multisku=int(umbral_viable), max_ubic=_max_ubic,
+                obstaculos=st.session_state["obstaculos"],
+                orientacion_pasillo=orientacion)
         st.session_state["slots"] = prop_auto["slots"]
         st.session_state["prop_resumen"] = prop_auto["resumen"]
         st.session_state["slots_rev"] += 1
@@ -806,24 +941,16 @@ with st.expander("🛠️ Avanzado · Ajustar a mano los tipos de ubicación",
         "una sola talla estándar, calculada automáticamente. Luego se acomoda "
         "por **familia** (las familias con más SKUs **A** toman las "
         "cabeceras). Solo se acomodan aquí los SKUs **viables** (≥ mínimo de "
-        "unidades, ver barra lateral); los de baja rotación van a la "
+        "unidades, ver reglas generales); los de baja rotación van a la "
         "🗃️ Zona especial (más abajo).")
-    c1, c2 = st.columns([1, 2])
-    n_tipos = c1.number_input("Nº de tipos de ubicación", 1, 8,
-                              st.session_state.get("n_tipos", 4), 1)
-    if (c2.button("📐 Calcular dimensiones óptimas", width='stretch')
-            or "tipos_catalogo" not in st.session_state):
-        st.session_state["tipos_catalogo"] = S.calcular_tipos_optimos(
-            df_viable, n_tipos=int(n_tipos))
-        st.session_state["n_tipos"] = int(n_tipos)
-        st.session_state["tipos_rev"] = st.session_state.get("tipos_rev", 0) + 1
-
     tipos_df = pd.DataFrame(st.session_state["tipos_catalogo"]).reindex(
-        columns=["codigo", "tipo", "w", "d", "niveles", "familia", "multisku",
-                "cap_loc", "n_skus", "n_pos_cubiertas"])
+        columns=["codigo", "tipo", "zona_fisica", "tipo_estructura",
+                 "estado_medidas", "w", "d", "niveles", "familia", "multisku",
+                 "cap_loc", "n_skus", "n_pos_cubiertas"])
     # Un catálogo vacío nace con columnas float en pandas. Streamlit no permite
     # configurarlas como texto/check sin fijar su tipo antes del editor.
-    for col in ("codigo", "tipo", "familia"):
+    for col in ("codigo", "tipo", "zona_fisica", "tipo_estructura",
+                "estado_medidas", "familia"):
         tipos_df[col] = tipos_df[col].astype("object")
     tipos_df["multisku"] = tipos_df["multisku"].fillna(False).astype(bool)
     st.caption("Puedes ajustar ancho/largo/niveles a mano si quieres afinar el "
@@ -837,6 +964,12 @@ with st.expander("🛠️ Avanzado · Ajustar a mano los tipos de ubicación",
         column_config={
             "codigo": st.column_config.TextColumn("Código", help="Prefijo del ID"),
             "tipo": st.column_config.TextColumn("Nombre"),
+            "zona_fisica": st.column_config.TextColumn(
+                "Mercancía", disabled=True),
+            "tipo_estructura": st.column_config.TextColumn(
+                "Estructura", disabled=True),
+            "estado_medidas": st.column_config.TextColumn(
+                "Estado", disabled=True),
             "w": st.column_config.NumberColumn("Ancho (m)", format="%.2f", min_value=0.1),
             "d": st.column_config.NumberColumn("Largo (m)", format="%.2f", min_value=0.1),
             "niveles": st.column_config.NumberColumn("Niveles", help="Vacío = auto"),
@@ -849,38 +982,22 @@ with st.expander("🛠️ Avanzado · Ajustar a mano los tipos de ubicación",
         })
     _sync_tipos("tipos_catalogo", tipos_edit, "tipos_rev")
 
-    if st.button("Aplicar diseño manual de tipos", type="secondary",
-                 width='stretch'):
-        tipos_validos = [t for t in st.session_state["tipos_catalogo"]
-                         if t.get("w") and t.get("d")]
-        prop = S.proponer_layout(
-            df_viable, cfg, pasillo_m=pasillo, tipos=tipos_validos,
-            umbral_multisku=0,
-            obstaculos=st.session_state["obstaculos"],
-            orientacion_pasillo=orientacion)
-        st.session_state["slots"] = prop["slots"]
-        st.session_state["prop_resumen"] = prop["resumen"]
-        st.session_state["slots_rev"] += 1
-        _precargar_grid(prop["slots"], orientacion, _catalogo())
-        m = prop["meta"]
-        st.toast(f"{m['total']} ubicaciones en {m['n_tipos']} tipo(s)"
-                 + (f" — {m['sin_espacio']} no cupieron" if m["sin_espacio"] else ""))
-        st.rerun()
-    if st.session_state["prop_resumen"] is not None:
-        st.markdown("**Plan por familia y tipo** (orden = cabeceras primero):")
-        st.dataframe(st.session_state["prop_resumen"], width='stretch',
-                     hide_index=True)
+    st.caption(
+        "Los cambios quedan guardados y se aplican al ejecutar **Optimizar el "
+        "acomodo por zona**. Así no se genera accidentalmente toda la nave con "
+        "una sola regla.")
 
-st.subheader("2 · Las ubicaciones")
-st.caption("El sistema propone dónde va cada cosa. Es el camino normal: "
-           "genera, revisa el resultado abajo y ajusta sólo si hace falta.")
+st.subheader("3 · Optimizar el acomodo por zona")
+st.caption("Define qué admite cada zona y si debe llevar pasillos. El sistema "
+           "prueba los acomodos permitidos dentro de cada una y aplica la "
+           "combinación que cubre más localidades con mejor uso de la huella.")
 
 # --------------------------------------------------------------------------- #
 # Reglas por zona: cada área del layout puede tener su propio ancho de pasillo,
 # su orientación y la mercancía que admite. Va ANTES de la generación porque el
 # espacio y sus reglas se definen primero; la propuesta se apoya en ellas.
 # --------------------------------------------------------------------------- #
-ZONA_REGLA_COLS = ["zona", "prioridad", "pasillo_m", "orientacion",
+ZONA_REGLA_COLS = ["zona", "prioridad", "modo_pasillo", "pasillo_m", "orientacion",
                    "margen_m", "zonas_fisicas", "familias", "tipos"]
 
 
@@ -893,9 +1010,10 @@ def _reglas_zona_seed(zonas, guardadas, pasillo_def, orientacion_def):
         filas.append({
             "zona": nombre,
             "prioridad": int(z.get("prioridad") or i + 1),
+            "modo_pasillo": str(r.get("modo_pasillo") or "auto"),
             "pasillo_m": (float(r["pasillo_m"])
                           if r.get("pasillo_m") is not None else pasillo_def),
-            "orientacion": str(r.get("orientacion") or orientacion_def),
+            "orientacion": str(r.get("orientacion") or "automatica"),
             "margen_m": (float(r["margen_m"])
                          if r.get("margen_m") is not None else 0.5),
             "zonas_fisicas": ", ".join(r.get("zonas_fisicas") or []),
@@ -916,6 +1034,8 @@ def _reglas_zona_desde_tabla(edit):
         for campo in ("pasillo_m", "margen_m"):
             if pd.notna(r.get(campo)):
                 regla[campo] = float(r[campo])
+        if str(r.get("modo_pasillo") or "").strip():
+            regla["modo_pasillo"] = str(r["modo_pasillo"]).strip()
         if str(r.get("orientacion") or "").strip():
             regla["orientacion"] = str(r["orientacion"]).strip()
         for campo in ("zonas_fisicas", "familias", "tipos"):
@@ -931,7 +1051,7 @@ st.session_state.setdefault("reglas_zona", {})
 _zonas_layout = st.session_state["zonas_layout"]
 
 with st.expander(
-        "🧩 Reglas por zona — pasillo, orientación y qué mercancía admite",
+        "Configurar y optimizar las zonas",
         expanded=bool(_zonas_layout) and not st.session_state["slots"]):
     if not _zonas_layout:
         st.info(
@@ -942,11 +1062,10 @@ with st.expander(
             "la nave.")
     else:
         st.caption(
-            "Cada zona se resuelve por separado, dentro de su propio "
-            "rectángulo. Un área de piso a granel puede ir **sin pasillo** "
-            "(0 m) y sin margen; una franja alta y angosta rinde más con "
-            "orientación **vertical**. Deja un campo vacío para heredar el "
-            "valor general de la barra lateral.")
+            "Cada zona se resuelve como un problema propio. En **Pasillos** "
+            "elige si debe llevarlos, omitirlos o evaluar ambos; en "
+            "**Orientación** puedes fijar una dirección o dejar que el motor "
+            "pruebe horizontal y vertical.")
         _zf_disponibles = sorted(
             df.get("zona_fisica", pd.Series(dtype=str))
             .dropna().astype(str).str.upper().unique()) if len(df) else []
@@ -956,8 +1075,11 @@ with st.expander(
                 + "**. Escribe una o varias en «zonas físicas» para reservar "
                 "esa área a esa mercancía; vacío = admite cualquiera.")
 
+        _reglas_semilla = CZ.vincular_tipos_a_reglas(
+            st.session_state["reglas_zona"], _tipos_capacidad,
+            [str(z.get("nombre")) for z in _zonas_layout])
         _seed = _reglas_zona_seed(_zonas_layout,
-                                  st.session_state["reglas_zona"],
+                                  _reglas_semilla,
                                   float(pasillo), orientacion)
         _edit = st.data_editor(
             _seed, width="stretch", hide_index=True, num_rows="fixed",
@@ -969,25 +1091,36 @@ with st.expander(
                     help="Orden en que se resuelven. La mercancía que ya cabe "
                          "en una zona no vuelve a pedir espacio en la "
                          "siguiente."),
+                "modo_pasillo": st.column_config.SelectboxColumn(
+                    "Pasillos", options=["auto", "con", "sin"],
+                    help="Auto evalúa con y sin pasillos. Usa 'con' cuando "
+                         "la accesibilidad sea obligatoria."),
                 "pasillo_m": st.column_config.NumberColumn(
-                    "Pasillo (m)", min_value=0.0, max_value=10.0, step=0.1,
+                    "Ancho de pasillo (m)", min_value=0.0, max_value=10.0, step=0.1,
                     format="%.2f",
-                    help="0 = sin pasillo; las hileras quedan pegadas."),
+                    help="Se usa al evaluar o exigir el modo con pasillos."),
                 "orientacion": st.column_config.SelectboxColumn(
-                    "Orientación", options=["horizontal", "vertical"]),
+                    "Orientación",
+                    options=["automatica", "horizontal", "vertical"]),
                 "margen_m": st.column_config.NumberColumn(
                     "Margen (m)", min_value=0.0, max_value=5.0, step=0.1,
                     format="%.2f",
                     help="Holgura contra el borde de la zona."),
                 "zonas_fisicas": st.column_config.TextColumn(
-                    "Zonas físicas que admite",
-                    help="Separadas por coma. Vacío = cualquiera."),
+                    "Mercancía que admite",
+                    help="Zonas físicas de origen, separadas por coma. Si el "
+                         "área tiene el mismo nombre, se vincula automáticamente."),
                 "familias": st.column_config.TextColumn(
                     "Familias que admite", help="Separadas por coma."),
                 "tipos": st.column_config.TextColumn(
-                    "Tipos de ubicación", help="Códigos separados por coma."),
+                    "Tipos de localidad",
+                    help="Se completan desde el cálculo por mercancía. Puedes "
+                         "restringirlos manualmente."),
             })
         st.session_state["reglas_zona"] = _reglas_zona_desde_tabla(_edit)
+        _reglas_efectivas = CZ.vincular_tipos_a_reglas(
+            st.session_state["reglas_zona"], _tipos_capacidad,
+            [str(z.get("nombre")) for z in _zonas_layout])
 
         _prioridades = {str(r["zona"]): int(r["prioridad"])
                         for _, r in _edit.iterrows() if pd.notna(r["prioridad"])}
@@ -995,14 +1128,42 @@ with st.expander(
             for z in st.session_state["zonas_layout"]:
                 if z.get("nombre") in _prioridades:
                     z["prioridad"] = _prioridades[z["nombre"]]
+        _cfg_zonas = replace(
+            cfg, zonas=[dict(z) for z in st.session_state["zonas_layout"]])
 
-        if st.button("🧩 Generar ubicaciones zona por zona", type="primary",
+        _tipos = [t for t in st.session_state.get("tipos_catalogo", [])
+                  if t.get("w") and t.get("d")]
+        if _tipos and not df_viable.empty and not _capacidad_zonas["por_zona"].empty:
+            _cap_por_zf = _capacidad_zonas["por_zona"].set_index("zona_fisica")
+            _map_rows = []
+            for z in _zonas_layout:
+                _nombre = str(z.get("nombre"))
+                _regla = _reglas_efectivas.get(_nombre, {})
+                _perfiles = [str(v).strip().upper()
+                             for v in _regla.get("zonas_fisicas", [])]
+                _filas = _cap_por_zf.loc[
+                    _cap_por_zf.index.intersection(_perfiles)] if _perfiles else pd.DataFrame()
+                if isinstance(_filas, pd.Series):
+                    _filas = _filas.to_frame().T
+                _map_rows.append({
+                    "área del plano": _nombre,
+                    "mercancía": ", ".join(_perfiles) or "Sin reservar",
+                    "estructura": (", ".join(sorted(set(
+                        _filas["estructura"].astype(str)))) if len(_filas) else "—"),
+                    "tipos": len(_regla.get("tipos", [])),
+                    "localidades del perfil": int(
+                        _filas["localidades_total"].sum()) if len(_filas) else 0,
+                    "módulos del perfil": int(
+                        _filas["modulos_fisicos"].sum()) if len(_filas) else 0,
+                })
+            st.markdown("**Vinculación entre mercancía y áreas del plano**")
+            st.dataframe(pd.DataFrame(_map_rows), width="stretch", hide_index=True)
+
+        if st.button("Probar acomodos y aplicar la mejor combinación", type="primary",
                      width="stretch"):
             if df_viable.empty:
                 st.error("No hay SKU con dimensiones y unidades utilizables.")
             else:
-                _tipos = [t for t in st.session_state.get("tipos_catalogo", [])
-                          if t.get("w") and t.get("d")]
                 if not _tipos:
                     _tipos = S.calcular_tipos_optimos(
                         df_viable, n_tipos=int(st.session_state.get("n_tipos", 4)))
@@ -1010,15 +1171,15 @@ with st.expander(
                     st.session_state["tipos_rev"] = st.session_state.get(
                         "tipos_rev", 0) + 1
                 try:
-                    with st.spinner("Generando zona por zona…"):
-                        _pz = S.proponer_por_zonas(
-                            df_viable, cfg, tipos=_tipos,
+                    with st.spinner("Probando acomodos dentro de cada zona…"):
+                        _pz = S.optimizar_por_zonas(
+                            df_viable, _cfg_zonas, tipos=_tipos,
                             pasillo_m=float(pasillo),
-                            orientacion_pasillo=orientacion,
                             umbral_multisku=int(umbral_viable),
                             max_ubic=_max_ubic,
                             obstaculos=st.session_state["obstaculos"],
-                            reglas=st.session_state["reglas_zona"])
+                            reglas=_reglas_efectivas,
+                            estructuras=_estructuras_por_zf)
                 except ValueError as exc:
                     st.error(str(exc))
                     _pz = None
@@ -1026,14 +1187,25 @@ with st.expander(
                     st.session_state["slots"] = _pz["slots"]
                     st.session_state["prop_resumen"] = _pz["resumen"]
                     st.session_state["reparto_zonas"] = _pz["por_zona"]
+                    st.session_state["alternativas_zona"] = _pz["alternativas_zona"]
+                    st.session_state["reglas_zona_optimas"] = _pz["reglas_optimas"]
                     st.session_state["slots_rev"] += 1
                     _precargar_grid(_pz["slots"], orientacion, _catalogo())
                     st.rerun()
 
     _reparto = st.session_state.get("reparto_zonas")
     if _reparto is not None and len(_reparto):
-        st.markdown("**Qué se generó en cada zona**")
+        st.markdown("**Resultado elegido por zona**")
         st.dataframe(_reparto, width="stretch", hide_index=True)
+        _alternativas_zona = st.session_state.get("alternativas_zona")
+        if _alternativas_zona is not None and len(_alternativas_zona):
+            with st.expander("Comparar todos los acomodos evaluados", expanded=False):
+                _cols_alt = [
+                    "zona", "seleccionada", "modo", "orientacion", "pasillo_m",
+                    "requeridas", "ubicaciones", "faltantes", "cobertura_pct",
+                    "huella_usada_m2", "eficiencia_huella_pct"]
+                st.dataframe(_alternativas_zona[_cols_alt], width="stretch",
+                             hide_index=True)
         _vacias = _reparto[_reparto["ubicaciones"] == 0]
         if len(_vacias):
             st.warning(
@@ -1043,20 +1215,23 @@ with st.expander(
                 + ". Revisa sus reglas: un filtro de mercancía muy estrecho o "
                 "un pasillo ancho en una zona angosta la dejan vacía.")
 
-with st.expander("✨ Generar ubicaciones automáticamente",
-                 expanded=not st.session_state["slots"]):
+with st.expander("Avanzado · Optimizar todo con una sola regla",
+                 expanded=False):
     st.caption(
-        "Genera alternativas con diferente número de tipos y orientación. El "
+        "Alternativa para tratar toda la nave con la misma orientación y el "
+        "mismo esquema de pasillos. Si definiste zonas, usa preferentemente "
+        "el optimizador anterior. Este modo genera alternativas con diferente "
+        "número de tipos y orientación. El "
         "orden de decisión es: cumplir cobertura, usar menos m² y después "
-        "reducir la distancia estimada al depot. La distancia final se valida "
-        "en la página Simulación.")
+        "reducir la distancia estimada al andén. La distancia final se valida "
+        "en Evaluar y decidir.")
     oc1, oc2, oc3, oc4 = st.columns(4)
     opt_tipos = oc1.number_input("Máx. tipos", 1, 8, 5, 1, key="opt_tipos")
     opt_cobertura = oc2.number_input("Cobertura mínima (%)", 0.0, 100.0, 100.0,
                                      1.0, key="opt_cobertura")
-    opt_dx = oc3.number_input("Depot X (m)", 0.0, float(ancho), 0.0, 0.5,
+    opt_dx = oc3.number_input("Andén X (m)", 0.0, float(ancho), 0.0, 0.5,
                               key="opt_depot_x")
-    opt_dy = oc4.number_input("Depot Y (m)", 0.0, float(largo), 0.0, 0.5,
+    opt_dy = oc4.number_input("Andén Y (m)", 0.0, float(largo), 0.0, 0.5,
                               key="opt_depot_y")
     if st.button("Generar mejor alternativa", type="primary", width='stretch'):
         with st.spinner("Generando y evaluando alternativas…"):
@@ -1096,6 +1271,10 @@ with st.expander("✨ Generar ubicaciones automáticamente",
             _precargar_grid(elegida["slots"], elegida["orientacion"], _catalogo())
             st.rerun()
 
+
+st.subheader("4 · Revisar el resultado")
+st.caption("Comprueba cobertura y espacio, revisa el plano y ajusta sólo las "
+           "excepciones antes de pasar a Evaluar y decidir.")
 
 slots_list = st.session_state["slots"]
 slots_operables = [s for s in slots_list
@@ -1328,11 +1507,14 @@ if st.session_state.get("move_msg"):
 # --------------------------------------------------------------------------- #
 # 3) El resultado: 2D -> 3D -> asignaciones -> datos
 # --------------------------------------------------------------------------- #
-st.subheader("3 · El resultado")
+st.subheader("Resultado detallado")
 st.caption("Cómo quedó el acomodo. Si convence, ya puedes pasar a simular la "
            "operación; si no, vuelve a generar arriba con otros parámetros.")
-t2d, t3d, tasig, tdat = st.tabs(
-    ["🗺️ 2D — editar", "🧊 3D", "🔗 Asignaciones", "📋 Datos"])
+t2d, t3d, tinventario = st.tabs(
+    ["🗺️ Plano y edición", "🧊 Vista 3D", "📋 Inventario"]
+)
+with tinventario:
+    tasig, tdat = st.tabs(["Asignaciones", "Datos y exportación"])
 
 with t2d:
     color_por = st.radio("Colorear por", ["familia", "clase_abc"],
@@ -1464,21 +1646,21 @@ with t2d:
         st.caption(
             "Arma tu layout como una hoja de cálculo: cada **fila** es una "
             "hilera de ubicaciones y cada celda una ubicación — escribe el "
-            "**código** de un tipo (tabla de '🧮 Diseño automático'); vacío = "
+            "**código** de un tipo (calculado en el paso 1); vacío = "
             "hueco. `A=2.5x1.2` usa el tipo A pero con **dimensiones "
             "propias** (2.5 m de ancho × 1.2 m de largo) — así pruebas "
             "cambios de tamaño puntuales sin tocar el catálogo. Sufijo `*` "
             "(p. ej. `A*` o `A=2.5x1.2*`) = ubicación **multi-SKU** "
             "(acepta tantos SKUs/unidades como quepan). **Pasillos**: una "
             "FILA completa con `P` es un pasillo entre hileras (`P3.5` = "
-            "3.5 m; `P` solo = ancho de la barra lateral; `P0` = hileras "
+            "3.5 m; `P` solo = ancho general; `P0` = hileras "
             "pegadas, doble fondo); una CELDA `P` dentro de una hilera deja "
             "un **hueco/pasillo a lo ancho** en ese punto (p. ej. "
             "`A P2 A`) — el código `P` queda reservado. Puedes **agregar o "
             "borrar filas** directamente en la tabla (＋/🗑) para insertar "
             "pasillos. Si usas filas `P`, los pasillos entre hileras solo "
             "existen donde los escribas; sin ellas se separa cada "
-            "hilera con el pasillo de la barra lateral. Al **Proponer "
+            "hilera con el pasillo de las reglas generales. Al **Proponer "
             "layout** la cuadrícula se precarga con el diseño automático "
             "(incluidos sus pasillos) para que solo hagas ajustes. Copia y "
             "pega bloques (Ctrl+C / Ctrl+V) igual que en Excel y pulsa "
@@ -1520,8 +1702,7 @@ with t2d:
                 _precargar_grid(nuevos_t, orientacion, _catalogo())
                 st.rerun()
         else:
-            st.warning("Primero define al menos un tipo en "
-                      "'🧮 Diseño automático' (arriba).")
+            st.warning("Primero calcula al menos un tipo de localidad en el paso 1.")
         catalogo = _catalogo()
 
         gc1, gc2, gc3 = st.columns(3)
@@ -1748,7 +1929,7 @@ with tdat:
         st.dataframe(res["overflow"], width='stretch', hide_index=True)
 
 if not slots_list:
-    st.info("👉 Empieza con el **Diseño automático** de arriba, o arma tu "
+    st.info("👉 Empieza con **Optimizar el acomodo por zona**, o arma tu "
             "layout con la **🔲 Cuadrícula** (pestaña 2D).")
 
 # --------------------------------------------------------------------------- #
@@ -1777,8 +1958,7 @@ else:
     st.session_state.setdefault("tipos_rev_esp", 0)
     st.session_state.setdefault("n_tipos_esp", 2)
 
-    with st.expander("⚙️ Configurar zona especial",
-                     expanded=not st.session_state["slots_especial"]):
+    with st.expander("⚙️ Configurar zona especial", expanded=False):
         ce1, ce2, ce3 = st.columns(3)
         largo_e = ce1.number_input("Largo (m)", 2.0, 200.0, step=1.0,
                                    key="largo_esp_m")

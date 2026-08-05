@@ -27,7 +27,7 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 import pandas as pd
 
-from slotting.geometry import rectangulo_en_poligono
+from slotting.geometry import area_poligono, rectangulo_en_poligono
 from slotting import structures as ST
 from slotting.piso.compatibility import sku_compartible, skus_compatibles
 from slotting.piso.contracts import PisoPolicy
@@ -1170,6 +1170,7 @@ def proponer_layout_racks(
         tipos: list[dict],
         obstaculos: list[dict] | None = None,
         orientacion_pasillo: str = "horizontal",
+        margen_m: float = 0.5,
 ) -> dict:
     """Genera módulos físicos de rack y sus subdivisiones lógicas.
 
@@ -1194,7 +1195,8 @@ def proponer_layout_racks(
             for o in (obstaculos or [])
         ]
         out = proponer_layout_racks(
-            df, cfg_c, estructura, pasillo_m, tipos, obst_c, "horizontal")
+            df, cfg_c, estructura, pasillo_m, tipos, obst_c, "horizontal",
+            margen_m)
         out["slots"] = [{
             **s,
             "x": s["y"], "y": s["x"], "w": s["d"], "d": s["w"],
@@ -1269,18 +1271,19 @@ def proponer_layout_racks(
     perimetro = cfg.perimetro
     obst = obstaculos or []
     slots, sin_espacio, n = [], 0, 0
-    y_cursor, fila_global = 0.5, 0
+    margen = max(0.0, float(margen_m))
+    y_cursor, fila_global = margen, 0
     for _, f in resumen.iterrows():
-        x, y = 0.5, y_cursor
+        x, y = margen, y_cursor
         y_ult = None
         for _ in range(int(f["modulos"])):
             colocado = False
-            while y + d_mod <= cfg.largo_m - 0.5 + 1e-9:
-                if x + w_mod > cfg.ancho_m - 0.5 + 1e-9:
+            while y + d_mod <= cfg.largo_m - margen + 1e-9:
+                if x + w_mod > cfg.ancho_m - margen + 1e-9:
                     separacion = (
                         0.10 if cfg.estrategia_pasillo == "espejo"
                         and fila_global % 2 == 0 else pasillo_m)
-                    x, y = 0.5, y + d_mod + separacion
+                    x, y = margen, y + d_mod + separacion
                     fila_global += 1
                     continue
                 cand = {"x": x, "y": y, "w": w_mod, "d": d_mod}
@@ -1650,7 +1653,7 @@ def proponer_layout(df, cfg: SlotConfig, pasillo_m: float = 3.5,
 # Reglas que puede llevar cada zona del layout. Todas son opcionales: lo que no
 # se declara hereda el valor general, así que una zona sin reglas se comporta
 # exactamente como antes.
-CAMPOS_REGLA_ZONA = ("pasillo_m", "orientacion", "margen_m", "tipos",
+CAMPOS_REGLA_ZONA = ("pasillo_m", "modo_pasillo", "orientacion", "margen_m", "tipos",
                      "zonas_fisicas", "familias", "clases", "solo_mono",
                      "solo_multi")
 
@@ -1696,6 +1699,152 @@ def _ventana_zona(zona: dict) -> tuple:
             float(zona["y"]) + float(zona["d"]))
 
 
+def _area_zona(zona: dict) -> float:
+    """Superficie real de una zona rectangular o poligonal."""
+    if zona.get("poligono"):
+        return float(area_poligono(zona["poligono"]))
+    return float(zona.get("w", 0)) * float(zona.get("d", 0))
+
+
+def _estructura_para_regla(nombre: str, regla: dict,
+                            estructuras: dict | None) -> dict | None:
+    """Estructura física que corresponde al perfil admitido por un área."""
+    if not estructuras:
+        return None
+    mapa = {str(k).strip().upper(): dict(v)
+            for k, v in estructuras.items() if v}
+    zonas = _lista(regla.get("zonas_fisicas"))
+    if not zonas and str(nombre).strip().upper() in mapa:
+        zonas = [nombre]
+    candidatas = [mapa[z.strip().upper()] for z in zonas
+                  if z.strip().upper() in mapa]
+    if not candidatas:
+        return None
+    firmas = {
+        (str(e.get("tipo_estructura", "PISO")).upper(),
+         float(e.get("ancho_modulo_m", 0)),
+         float(e.get("fondo_modulo_m", 0)),
+         int(e.get("niveles_rack", 1)))
+        for e in candidatas
+    }
+    if len(firmas) > 1:
+        raise ValueError(
+            f"La zona '{nombre}' admite mercancías con estructuras distintas. "
+            "Divídela en áreas separadas o deja una sola zona física por área.")
+    return candidatas[0]
+
+
+def _generar_rack_en_zona(df: pd.DataFrame, cfg: SlotConfig, zona: dict,
+                          estructura: dict, tipos: list[dict], pasillo_m: float,
+                          orientacion: str, margen_m: float,
+                          obstaculos: list[dict]) -> dict:
+    """Genera rack en coordenadas locales y lo devuelve al plano completo."""
+    x0, y0, x1, y1 = _ventana_zona(zona)
+    ancho, largo = x1 - x0, y1 - y0
+    if zona.get("poligono"):
+        poligono = [(float(x) - x0, float(y) - y0)
+                    for x, y in zona["poligono"]]
+        zona_local = {**zona, "poligono": poligono}
+    else:
+        poligono = [(0.0, 0.0), (ancho, 0.0),
+                    (ancho, largo), (0.0, largo)]
+        zona_local = {**zona, "x": 0.0, "y": 0.0,
+                      "w": ancho, "d": largo}
+    obst_local = [{**o, "x": float(o["x"]) - x0,
+                   "y": float(o["y"]) - y0}
+                  for o in obstaculos]
+    cfg_local = replace(cfg, ancho_m=ancho, largo_m=largo,
+                        perimetro=poligono, zonas=[zona_local])
+    out = proponer_layout_racks(
+        df, cfg_local, estructura, pasillo_m, tipos,
+        obstaculos=obst_local, orientacion_pasillo=orientacion,
+        margen_m=margen_m)
+    out["slots"] = [{**s, "x": round(float(s["x"]) + x0, 2),
+                     "y": round(float(s["y"]) + y0, 2)}
+                    for s in out["slots"]]
+    return out
+
+
+def calcular_necesidad_por_zonas(
+        df: pd.DataFrame, cfg: SlotConfig,
+        tipos: list[dict] | None = None,
+        umbral_multisku: int = 10,
+        max_ubic: dict | None = None,
+        reglas: dict | None = None) -> dict:
+    """Calcula las ubicaciones requeridas antes de intentar dibujarlas.
+
+    La demanda se reparte por prioridad y por las restricciones de mercancía
+    de cada zona. La geometría no limita este cálculo: responde primero
+    «cuántas localidades necesito» y deja para la optimización posterior la
+    pregunta «cómo caben en el área disponible».
+    """
+    zonas = [dict(z) for z in (cfg.zonas or [])]
+    if not zonas:
+        zonas = [{"nombre": "Nave completa", "prioridad": 1}]
+    if not tipos:
+        raise ValueError("Hace falta al menos un tipo de ubicación.")
+    reglas = {str(k): dict(v) for k, v in (reglas or {}).items()}
+    zonas.sort(key=lambda z: (float(z.get("prioridad") or 1e9),
+                              str(z.get("nombre") or "")))
+    pendientes = df.copy()
+    filas, resumenes = [], []
+    # Un lienzo virtual muy ancho evita que la geometría real recorte la
+    # necesidad. El motor genera exactamente las ubicaciones pedidas en una
+    # sola hilera y conserva la misma lógica de capacidades y multi-SKU.
+    cfg_plan = replace(cfg, ancho_m=1e12, largo_m=1e12,
+                       perimetro=[], zonas=[])
+    for i, zona in enumerate(zonas):
+        nombre = str(zona.get("nombre") or f"Zona {i + 1}")
+        regla = reglas.get(nombre, {})
+        admitida = _catalogo_de_zona(pendientes, regla)
+        tipos_permitidos = _lista(regla.get("tipos"))
+        tipos_zona = ([t for t in tipos
+                       if str(t.get("codigo")) in tipos_permitidos]
+                      or tipos)
+        if admitida.empty:
+            filas.append({
+                "zona": nombre, "prioridad": int(zona.get("prioridad") or i + 1),
+                "skus": 0, "ubicaciones_requeridas": 0,
+                "m2_ubicaciones": 0.0,
+                "motivo": "ningún SKU pendiente cumple sus reglas",
+            })
+            continue
+        out = _proponer_core(
+            admitida, cfg_plan, 0.0, tipos_zona, umbral_multisku, [],
+            None, None, max_ubic, ventana=(0.0, 0.0, 1e12, 1e12),
+            margen_m=0.0)
+        requeridas = (int(out["resumen"]["ubicaciones"].sum())
+                      if not out["resumen"].empty else 0)
+        area = sum(float(s["w"]) * float(s["d"]) for s in out["slots"])
+        filas.append({
+            "zona": nombre, "prioridad": int(zona.get("prioridad") or i + 1),
+            "skus": int(admitida["sku"].astype(str).nunique()),
+            "ubicaciones_requeridas": requeridas,
+            "m2_ubicaciones": round(area, 2), "motivo": None,
+        })
+        if not out["resumen"].empty:
+            detalle = out["resumen"].copy()
+            detalle.insert(0, "zona", nombre)
+            resumenes.append(detalle)
+        # La capacidad se planea una sola vez. Una zona prioritaria que admite
+        # esta mercancía se hace responsable de ella y evita duplicarla en las
+        # zonas posteriores.
+        atendidos = set(admitida["sku"].astype(str))
+        pendientes = pendientes[
+            ~pendientes["sku"].astype(str).isin(atendidos)]
+    tabla = pd.DataFrame(filas)
+    return {
+        "por_zona": tabla,
+        "resumen": (pd.concat(resumenes, ignore_index=True)
+                    if resumenes else pd.DataFrame()),
+        "ubicaciones_requeridas": int(
+            tabla["ubicaciones_requeridas"].sum()) if not tabla.empty else 0,
+        "m2_ubicaciones": round(float(tabla["m2_ubicaciones"].sum()), 2)
+        if not tabla.empty else 0.0,
+        "skus_sin_zona": int(pendientes["sku"].astype(str).nunique()),
+    }
+
+
 def proponer_por_zonas(df: pd.DataFrame, cfg: SlotConfig,
                        tipos: list[dict] | None = None,
                        pasillo_m: float = 3.5,
@@ -1704,7 +1853,8 @@ def proponer_por_zonas(df: pd.DataFrame, cfg: SlotConfig,
                        umbral_multisku: int = 10,
                        max_ubic: dict | None = None,
                        obstaculos: list[dict] | None = None,
-                       reglas: dict | None = None) -> dict:
+                       reglas: dict | None = None,
+                       estructuras: dict | None = None) -> dict:
     """Genera ubicaciones ZONA POR ZONA, cada una con sus propias reglas.
 
     `proponer_layout` trata las zonas como un filtro: tila la nave entera con un
@@ -1722,6 +1872,10 @@ def proponer_por_zonas(df: pd.DataFrame, cfg: SlotConfig,
     con su propio pasillo, orientación, margen, tipos de ubicación y mercancía
     admitida. `reglas` es {nombre_de_zona: {...}}; lo que no se declare hereda
     los valores generales que recibe esta función.
+
+    `estructuras` vincula zona física de mercancía con su configuración. Cuando
+    una regla admite un perfil RACK, se colocan módulos físicos y `distribuir`
+    los expande después en localidades lógicas por nivel y subdivisión.
 
     Un SKU se coloca en la PRIMERA zona que lo admite, siguiendo `prioridad`.
     Así, declarar una zona restringida con prioridad alta la reserva de verdad,
@@ -1765,37 +1919,55 @@ def proponer_por_zonas(df: pd.DataFrame, cfg: SlotConfig,
             ori_z = orientacion_pasillo
 
         if admitida.empty:
-            detalle.append({"zona": nombre, "ubicaciones": 0, "skus": 0,
+            detalle.append({"zona": nombre, "ubicaciones": 0,
+                            "localidades_logicas": 0,
+                            "requeridas": 0, "faltantes": 0,
+                            "cobertura_pct": 100.0, "skus": 0,
                             "pasillo_m": pas_z, "orientacion": ori_z,
                             "sin_espacio": 0,
+                            "area_zona_m2": round(_area_zona(zona), 2),
+                            "m2_ubicaciones": 0.0,
+                            "estructura": "Sin demanda",
                             "motivo": "ningún SKU pendiente cumple sus reglas"})
             continue
+
+        estructura_z = _estructura_para_regla(nombre, regla, estructuras)
+        es_rack = bool(
+            estructura_z
+            and str(estructura_z.get("tipo_estructura", "PISO")).upper()
+            == "RACK")
 
         # La zona se resuelve como un problema propio: su ventana, su pasillo y
         # su orientación. Para la orientación vertical se transpone igual que en
         # `proponer_layout`, pero acotado a esta zona.
         vertical = ori_z == "vertical"
         zona_geo = {**zona}
-        if vertical:
-            cfg_z = replace(cfg, largo_m=cfg.ancho_m, ancho_m=cfg.largo_m)
-            obst_z = [{**o, "x": o["y"], "y": o["x"], "w": o["d"], "d": o["w"]}
-                      for o in obstaculos]
-            perim_z = [(y, x) for x, y in (cfg.perimetro or [])]
-            if zona_geo.get("poligono"):
-                zona_geo["poligono"] = [(y, x) for x, y in zona_geo["poligono"]]
-            else:
-                zona_geo = {**zona_geo, "x": zona["y"], "y": zona["x"],
-                            "w": zona["d"], "d": zona["w"]}
+        if es_rack:
+            out = _generar_rack_en_zona(
+                admitida, cfg, zona, estructura_z, tipos_zona, pas_z, ori_z,
+                mar_z, obstaculos)
         else:
-            cfg_z, obst_z, perim_z = cfg, obstaculos, cfg.perimetro
+            if vertical:
+                cfg_z = replace(cfg, largo_m=cfg.ancho_m, ancho_m=cfg.largo_m)
+                obst_z = [{**o, "x": o["y"], "y": o["x"],
+                           "w": o["d"], "d": o["w"]}
+                          for o in obstaculos]
+                perim_z = [(y, x) for x, y in (cfg.perimetro or [])]
+                if zona_geo.get("poligono"):
+                    zona_geo["poligono"] = [(y, x) for x, y in zona_geo["poligono"]]
+                else:
+                    zona_geo = {**zona_geo, "x": zona["y"], "y": zona["x"],
+                                "w": zona["d"], "d": zona["w"]}
+            else:
+                cfg_z, obst_z, perim_z = cfg, obstaculos, cfg.perimetro
 
-        out = _proponer_core(
-            admitida, cfg_z, pas_z, tipos_zona, umbral_multisku, obst_z,
-            perim_z, [zona_geo], max_ubic,
-            ventana=_ventana_zona(zona_geo), margen_m=mar_z)
+            out = _proponer_core(
+                admitida, cfg_z, pas_z, tipos_zona, umbral_multisku, obst_z,
+                perim_z, [zona_geo], max_ubic,
+                ventana=_ventana_zona(zona_geo), margen_m=mar_z)
 
         nuevos = out["slots"]
-        if vertical and nuevos:
+        if vertical and nuevos and not es_rack:
             nuevos = [{**s, "x": s["y"], "y": s["x"], "w": s["d"], "d": s["w"]}
                       for s in nuevos]
         # Los identificadores se renumeran a nivel layout: cada zona los generó
@@ -1826,11 +1998,26 @@ def proponer_por_zonas(df: pd.DataFrame, cfg: SlotConfig,
             r.insert(0, "zona", nombre)
             resumenes.append(r)
 
+        columna_requerida = "modulos" if es_rack else "ubicaciones"
+        requeridas = (int(out["resumen"][columna_requerida].sum())
+                      if not out["resumen"].empty else 0)
+        localidades_logicas = int(out["meta"].get(
+            "ubicaciones_logicas", requeridas))
+        faltantes = max(requeridas - len(limpios), 0)
+        area_instalada = sum(float(s["w"]) * float(s["d"])
+                             for s in limpios)
         detalle.append({
             "zona": nombre, "ubicaciones": len(limpios),
+            "localidades_logicas": localidades_logicas,
+            "requeridas": requeridas, "faltantes": faltantes,
+            "cobertura_pct": round(
+                100 * len(limpios) / requeridas, 2) if requeridas else 100.0,
             "skus": int(admitida["sku"].astype(str).nunique()),
             "pasillo_m": pas_z, "orientacion": ori_z, "margen_m": mar_z,
             "tipos": ", ".join(str(t.get("codigo")) for t in tipos_zona),
+            "estructura": (estructura_z or {}).get("tipo_estructura", "PISO"),
+            "area_zona_m2": round(_area_zona(zona), 2),
+            "m2_ubicaciones": round(area_instalada, 2),
             "sin_espacio": int(out["meta"].get("sin_espacio", 0)),
             "solapados_descartados": descartados,
             "motivo": None if limpios else "no cupo ninguna ubicación",
@@ -1851,7 +2038,7 @@ def proponer_por_zonas(df: pd.DataFrame, cfg: SlotConfig,
         # catálogo en las dos primeras zonas y dejaba sin mercancía a las ocho
         # restantes, aunque tuvieran espacio de sobra.
         if limpios and not admitida.empty:
-            pedidas = (int(out["resumen"]["ubicaciones"].sum())
+            pedidas = (int(out["resumen"][columna_requerida].sum())
                        if not out["resumen"].empty else len(limpios))
             fraccion = min(len(limpios) / max(pedidas, 1), 1.0)
             orden = _orden_skus(admitida, cfg)
@@ -1881,6 +2068,141 @@ def proponer_por_zonas(df: pd.DataFrame, cfg: SlotConfig,
             "por_zona": detalle,
         },
     }
+
+
+def optimizar_por_zonas(df: pd.DataFrame, cfg: SlotConfig,
+                        tipos: list[dict] | None = None,
+                        pasillo_m: float = 3.5,
+                        margen_m: float = 0.5,
+                        umbral_multisku: int = 10,
+                        max_ubic: dict | None = None,
+                        obstaculos: list[dict] | None = None,
+                        reglas: dict | None = None,
+                        estructuras: dict | None = None) -> dict:
+    """Prueba modos de acomodo y elige el mejor de forma independiente.
+
+    Para cada zona se evalúan las orientaciones horizontal y vertical cuando
+    su regla indica ``automatica``. ``modo_pasillo`` controla si se prueba con
+    pasillo, sin pasillo o ambos (``auto``). El ranking prioriza cubrir las
+    localidades requeridas y después aprovechar mejor la huella ocupada.
+
+    La optimización es secuencial según la prioridad de las zonas. Así conserva
+    la misma reserva de mercancía que :func:`proponer_por_zonas` y evita que dos
+    zonas se dimensionen para los mismos SKU.
+    """
+    zonas = [dict(z) for z in (cfg.zonas or [])]
+    if not zonas:
+        raise ValueError(
+            "No hay zonas definidas en el layout. Configúralas antes de "
+            "optimizar su acomodo.")
+    if not tipos:
+        raise ValueError("Hace falta al menos un tipo de ubicación.")
+    zonas.sort(key=lambda z: (float(z.get("prioridad") or 1e9),
+                              str(z.get("nombre") or "")))
+    base = {str(k): dict(v) for k, v in (reglas or {}).items()}
+    elegidas: dict[str, dict] = {}
+    alternativas: list[dict] = []
+
+    for i, zona in enumerate(zonas):
+        nombre = str(zona.get("nombre") or f"Zona {i + 1}")
+        regla = dict(base.get(nombre, {}))
+        orientacion_cfg = str(
+            regla.get("orientacion") or "automatica").strip().lower()
+        orientaciones = ([orientacion_cfg]
+                         if orientacion_cfg in ("horizontal", "vertical")
+                         else ["horizontal", "vertical"])
+        modo = str(regla.get("modo_pasillo") or "auto").strip().lower()
+        ancho_pasillo = regla.get("pasillo_m")
+        ancho_pasillo = float(
+            pasillo_m if ancho_pasillo is None
+            or (isinstance(ancho_pasillo, float) and math.isnan(ancho_pasillo))
+            else ancho_pasillo)
+        if modo in ("sin", "sin pasillo", "no"):
+            pasillos = [0.0]
+        elif modo in ("con", "con pasillo", "si", "sí"):
+            pasillos = [max(0.0, ancho_pasillo)]
+        else:
+            pasillos = list(dict.fromkeys([0.0, max(0.0, ancho_pasillo)]))
+
+        candidatos = []
+        for orientacion in orientaciones:
+            for pasillo_candidato in pasillos:
+                regla_candidata = {
+                    **regla,
+                    "orientacion": orientacion,
+                    "pasillo_m": pasillo_candidato,
+                }
+                reglas_parciales = {**elegidas, nombre: regla_candidata}
+                cfg_parcial = replace(cfg, zonas=[dict(z) for z in zonas[:i + 1]])
+                prop = proponer_por_zonas(
+                    df, cfg_parcial, tipos=tipos, pasillo_m=pasillo_m,
+                    orientacion_pasillo="horizontal", margen_m=margen_m,
+                    umbral_multisku=umbral_multisku, max_ubic=max_ubic,
+                    obstaculos=obstaculos, reglas=reglas_parciales,
+                    estructuras=estructuras)
+                fila = prop["por_zona"][
+                    prop["por_zona"]["zona"] == nombre].iloc[0].to_dict()
+                slots_zona = [s for s in prop["slots"]
+                              if s.get("zona_layout") == nombre]
+                area_instalada = sum(float(s["w"]) * float(s["d"])
+                                     for s in slots_zona)
+                if slots_zona:
+                    x0 = min(float(s["x"]) for s in slots_zona)
+                    y0 = min(float(s["y"]) for s in slots_zona)
+                    x1 = max(float(s["x"]) + float(s["w"])
+                             for s in slots_zona)
+                    y1 = max(float(s["y"]) + float(s["d"])
+                             for s in slots_zona)
+                    huella = max(0.0, (x1 - x0) * (y1 - y0))
+                else:
+                    huella = 0.0
+                eficiencia = (100 * area_instalada / huella
+                              if huella > 0 else 0.0)
+                candidato = {
+                    "zona": nombre,
+                    "modo": ("Sin pasillos" if pasillo_candidato == 0
+                             else "Con pasillos"),
+                    "orientacion": orientacion,
+                    "pasillo_m": round(pasillo_candidato, 2),
+                    "requeridas": int(fila.get("requeridas", 0)),
+                    "ubicaciones": int(fila.get("ubicaciones", 0)),
+                    "faltantes": int(fila.get("faltantes", 0)),
+                    "cobertura_pct": float(fila.get("cobertura_pct", 0)),
+                    "area_zona_m2": round(_area_zona(zona), 2),
+                    "m2_ubicaciones": round(area_instalada, 2),
+                    "huella_usada_m2": round(huella, 2),
+                    "eficiencia_huella_pct": round(eficiencia, 2),
+                    "regla": regla_candidata,
+                }
+                candidatos.append(candidato)
+
+        candidatos.sort(key=lambda c: (
+            c["faltantes"] > 0, c["faltantes"],
+            -c["eficiencia_huella_pct"], c["huella_usada_m2"],
+            0 if c["pasillo_m"] > 0 else 1,
+            c["orientacion"],
+        ))
+        mejor = candidatos[0]
+        elegidas[nombre] = dict(mejor["regla"])
+        for candidato in candidatos:
+            candidato["seleccionada"] = candidato is mejor
+            alternativas.append({k: v for k, v in candidato.items()
+                                  if k != "regla"})
+
+    final = proponer_por_zonas(
+        df, cfg, tipos=tipos, pasillo_m=pasillo_m,
+        orientacion_pasillo="horizontal", margen_m=margen_m,
+        umbral_multisku=umbral_multisku, max_ubic=max_ubic,
+        obstaculos=obstaculos, reglas=elegidas, estructuras=estructuras)
+    if not final["por_zona"].empty:
+        final["por_zona"]["modo_pasillo"] = final["por_zona"]["zona"].map(
+            lambda nombre: "Sin pasillos"
+            if float(elegidas.get(str(nombre), {}).get("pasillo_m", pasillo_m)) == 0
+            else "Con pasillos")
+    final["alternativas_zona"] = pd.DataFrame(alternativas)
+    final["reglas_optimas"] = elegidas
+    final["meta"]["alternativas_evaluadas"] = len(alternativas)
+    return final
 
 
 def _distancia_surtido_estimada(df: pd.DataFrame, res: dict,

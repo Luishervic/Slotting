@@ -9,6 +9,7 @@ import streamlit as st
 
 from slotting import contexto as CX
 from slotting import io as IO
+from slotting import validation as V
 from slotting.paths import PROJECT_ROOT
 from slotting.ui import confirmar_accion, navegacion, titulo_pagina
 
@@ -20,10 +21,12 @@ st.set_page_config(
 )
 navegacion("datos")
 titulo_pagina(
-    "Paso 1 de 4",
-    "Datos y alcance",
-    "Selecciona el CEDIS, valida la fuente y confirma los SKU del escenario.",
+    "Paso 1 de 3",
+    "Datos y demanda",
+    "Selecciona el origen, revisa la calidad y confirma el objetivo del análisis.",
 )
+
+st.markdown("### 1 · Origen y alcance")
 
 facilities = CX.cedis_disponibles(PROJECT_ROOT)
 by_code = {facility.codigo: facility for facility in facilities}
@@ -166,6 +169,56 @@ m2.metric("Unidades", f"{pd.to_numeric(base.get('unidades'), errors='coerce').fi
 m3.metric("Dimensiones válidas", f"{valid_dimensions.sum():,}")
 m4.metric("Pendientes", f"{(~valid_dimensions).sum():,}")
 
+
+@st.cache_data(show_spinner=False)
+def _validar_calidad(data: pd.DataFrame) -> V.ValidationResult:
+    return V.validate(data)
+
+
+calidad = _validar_calidad(base)
+issues = calidad.df_issues
+n_skus_issue = issues["sku"].nunique() if not issues.empty else 0
+n_alta = int((issues["severidad"] == "alta").sum()) if not issues.empty else 0
+
+st.markdown("### 2 · Calidad de datos")
+with st.expander(
+    "Revisión automática"
+    + (f" · {n_skus_issue:,} SKU requieren atención" if n_skus_issue else " · sin hallazgos"),
+    expanded=False,
+):
+    q1, q2, q3 = st.columns(3)
+    q1.metric("SKU revisados", f"{len(base):,}")
+    q2.metric("SKU con observaciones", f"{n_skus_issue:,}")
+    q3.metric("Problemas de severidad alta", f"{n_alta:,}")
+    if issues.empty:
+        st.success("No se detectaron problemas con los umbrales recomendados.")
+    else:
+        st.caption(
+            "La herramienta propone correcciones sólo para faltantes, ceros, "
+            "rangos y densidad; los valores atípicos se conservan para revisión."
+        )
+        st.dataframe(
+            issues[["sku", "campo", "regla", "severidad", "valor_original",
+                    "valor_sugerido", "detalle"]].head(200),
+            width="stretch", hide_index=True,
+        )
+        if st.button("Usar correcciones recomendadas", key="aplicar_calidad_datos"):
+            flag_cols = [c for c in calidad.df_corregido if c.endswith("_flag")]
+            corregido = calidad.df_corregido.drop(
+                columns=flag_cols + ["tiene_problema"], errors="ignore"
+            )
+            st.session_state["df_base"] = corregido.copy()
+            st.session_state["df"] = corregido.copy()
+            st.session_state["calidad_aplicada"] = True
+            st.rerun()
+    st.page_link(
+        "pages/1_Validacion_de_datos.py",
+        label="Abrir revisión avanzada de calidad",
+        icon="🧹",
+    )
+
+st.markdown("### 3 · Selección y objetivo")
+
 filters = st.columns(3)
 filtered = base
 for container, column, label in (
@@ -177,7 +230,7 @@ for container, column, label in (
         options = sorted(
             filtered[column].dropna().astype(str).unique().tolist()
         )
-        selected = container.multiselect(label, options)
+        selected = container.multiselect(label, options, placeholder="Todos")
         if selected:
             filtered = filtered[filtered[column].astype(str).isin(selected)]
 
@@ -187,19 +240,67 @@ st.caption(
     "filas que cumplen los filtros."
 )
 
-if st.button("Confirmar alcance y continuar", type="primary", width="stretch"):
+numeric_columns = [
+    c for c in filtered.columns
+    if pd.api.types.is_numeric_dtype(filtered[c])
+]
+unit_default = "unidades" if "unidades" in numeric_columns else numeric_columns[0]
+target_candidates = [
+    c for c in numeric_columns
+    if any(token in c.lower() for token in ("objetivo", "target", "politica"))
+]
+scenario_options = ["Existencia actual", "Política objetivo", "Pico estacional"]
+scenario_name = st.segmented_control(
+    "Objetivo de inventario",
+    scenario_options,
+    default=st.session_state.get("escenario_nombre", "Existencia actual"),
+    key="escenario_nombre",
+    help="Define cuántas unidades debe poder alojar el diseño.",
+)
+scenario_name = scenario_name or "Existencia actual"
+column_default = (
+    target_candidates[0]
+    if scenario_name == "Política objetivo" and target_candidates
+    else unit_default
+)
+with st.expander("Ajustar la base del objetivo", expanded=scenario_name != "Existencia actual"):
+    objective_cols = st.columns(2)
+    current_column = st.session_state.get("escenario_columna", column_default)
+    if current_column not in numeric_columns:
+        current_column = column_default
+    objective_cols[0].selectbox(
+        "Columna de unidades",
+        numeric_columns,
+        index=numeric_columns.index(current_column),
+        key="escenario_columna",
+    )
+    factor_default = 1.25 if scenario_name == "Pico estacional" else 1.0
+    objective_cols[1].number_input(
+        "Factor sobre la columna",
+        0.0, 10.0,
+        float(st.session_state.get("escenario_factor", factor_default)),
+        0.05,
+        key="escenario_factor",
+    )
+st.caption(
+    f"Objetivo activo: **{scenario_name}** · "
+    f"{st.session_state.get('escenario_columna', column_default)} × "
+    f"{st.session_state.get('escenario_factor', 1.0):.2f}."
+)
+
+if st.button("Confirmar datos y diseñar", type="primary", width="stretch"):
     def _confirm_scope():
         st.session_state["df"] = filtered.copy()
         st.session_state["alcance_confirmado"] = True
 
     confirmar_accion(
-        titulo="Confirmar alcance",
+        titulo="Confirmar datos y objetivo",
         detalle=(
             f"Se analizarán {filtered['sku'].nunique():,} SKU de "
             f"{facility.nombre}. Cualquier layout anterior se reemplazará."
         ),
         al_confirmar=_confirm_scope,
-        etiqueta_confirmar="Confirmar",
+        etiqueta_confirmar="Confirmar y diseñar",
         destino="pages/2_Diseno.py",
         clave="confirmar_alcance",
     )

@@ -11,8 +11,8 @@ Aquí viven esos controles. Las páginas los dibujan llamando a `panel_operacion
 y todas comparten las MISMAS claves de `session_state`, así que capturar una vez
 alcanza y no hay dos versiones de la verdad.
 
-Criterio de qué se muestra: en la barra lateral quedan sólo los parámetros que
-cambian el resultado de forma que el usuario reconoce (velocidad, gente, turno).
+Criterio de qué se muestra: el modo recomendado conserva sólo los parámetros
+que cambian el resultado de forma que el usuario reconoce (gente y turno).
 Los desgloses finos —de qué se compone el tiempo por línea o el fijo por viaje—
 viven en desplegables cerrados: se pueden auditar, no estorban.
 """
@@ -61,8 +61,9 @@ def _def(clave):
 
 
 def panel_operacion(cfg_aco, *, con_interferencia: bool = True,
-                    con_metodo: bool = False) -> dict:
-    """Dibuja los controles de operación en la barra lateral.
+                    con_metodo: bool = False,
+                    mostrar_cuadrilla: bool = True) -> dict:
+    """Dibuja los controles compartidos de operación.
 
     Devuelve {"sim": SimConfig, "metodo": MetodoConfig|None, "frente": ...}.
     Todas las páginas que simulan llaman a esto, así que capturar la velocidad
@@ -71,14 +72,18 @@ def panel_operacion(cfg_aco, *, con_interferencia: bool = True,
     ancho = float(getattr(cfg_aco, "ancho_m", 40) or 40)
     largo = float(getattr(cfg_aco, "largo_m", 30) or 30)
 
-    st.header("Cuadrilla y turno")
-    n_ops = st.slider("Operadores en el turno", 1, 40,
-                      int(_def("op_operadores")), 1, key="op_operadores",
-                      help="El método de surtido que conviene depende de este "
-                           "número: con poca gente, zonificar no compra nada.")
-    horas = st.number_input("Horas por turno", 1.0, 24.0,
-                            float(_def("op_horas_turno")), 0.5,
-                            key="op_horas_turno")
+    if mostrar_cuadrilla:
+        st.header("Cuadrilla y turno")
+        n_ops = st.slider("Operadores en el turno", 1, 40,
+                          int(_def("op_operadores")), 1, key="op_operadores",
+                          help="El método de surtido que conviene depende de este "
+                               "número: con poca gente, zonificar no compra nada.")
+        horas = st.number_input("Horas por turno", 1.0, 24.0,
+                                float(_def("op_horas_turno")), 0.5,
+                                key="op_horas_turno")
+    else:
+        n_ops = int(_def("op_operadores"))
+        horas = float(_def("op_horas_turno"))
 
     st.header("Recorrido")
     vel = st.slider("Velocidad de recorrido (m/s)", 0.3, 3.0,
@@ -113,7 +118,7 @@ def panel_operacion(cfg_aco, *, con_interferencia: bool = True,
         n_acc = len(st.session_state.get("accesos", []))
         st.caption(f"{n_acc} accesos dibujados o importados del plano."
                    if n_acc else
-                   "⚠️ No hay accesos: dibújalos en Diseñar layout.")
+                   "⚠️ No hay accesos: dibújalos en Diseñar almacén.")
 
     # ---- Detalle fino: disponible, plegado ---------------------------- #
     with st.expander("⏱️ Tiempos de pick (detalle)"):

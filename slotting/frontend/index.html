@@ -3,13 +3,17 @@
 const root = document.getElementById("slot-drag-editor");
 let args = {}, slots = [], active = null;
 
-function send(type, value) {
-  window.parent.postMessage({isStreamlitMessage: true, type, value}, "*");
+function send(type, extra = {}) {
+  window.parent.postMessage({isStreamlitMessage: true, type, ...extra}, "*");
 }
 function ready() { send("streamlit:componentReady", {apiVersion: 1}); }
 function height() { send("streamlit:setFrameHeight", {height: document.body.scrollHeight}); }
 function snap(v) { const g = Number(args.rejilla || .25); return Math.round(v / g) * g; }
-function emit() { send("streamlit:setComponentValue", slots.map(s => ({...s}))); }
+function emit() {
+  send("streamlit:setComponentValue", {
+    value: slots.map(s => ({...s})), dataType: "json"
+  });
+}
 function scalePoint(e, svg) {
   const r = svg.getBoundingClientRect();
   return {x: (e.clientX - r.left) * Number(args.ancho) / r.width,

@@ -12,7 +12,8 @@ from slotting.ui import navegacion
 st.set_page_config(page_title="Validación de datos", page_icon="🧹",
                    layout="wide")
 navegacion("validacion")
-st.title("🧹 Validación y limpieza de datos")
+st.title("🧹 Calidad de datos")
+st.caption("Subpantalla avanzada de Datos y demanda.")
 
 if "df" not in st.session_state:
     st.warning("Primero carga una sección en la página principal (📦 Slotting).")
@@ -24,8 +25,8 @@ nombre = st.session_state.get("fuente_nombre", "seccion")
 # --------------------------------------------------------------------------- #
 # Configuración de umbrales
 # --------------------------------------------------------------------------- #
-with st.sidebar:
-    st.header("Umbrales")
+with st.expander("Umbrales avanzados", expanded=False):
+    st.markdown("#### Sensibilidad de la revisión")
     st.caption("Ajusta la sensibilidad de la detección.")
     mad = st.slider("Sensibilidad outliers (z robusto)", 2.0, 6.0, 3.5, 0.1,
                     help="Más bajo = más estricto (más outliers marcados).")

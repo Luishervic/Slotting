@@ -55,6 +55,42 @@ class BaseZonas(unittest.TestCase):
 
 
 class TestGeneracionPorZonas(BaseZonas):
+    def test_calcula_localidades_antes_de_validar_si_caben(self):
+        plan = S.calcular_necesidad_por_zonas(
+            self.df, self.cfg, tipos=self.tipos,
+            reglas={
+                "Piso a granel": {"zonas_fisicas": "PISO"},
+                "Rack angosto": {"zonas_fisicas": "RACK"},
+            })
+        self.assertGreater(plan["ubicaciones_requeridas"], 0)
+        self.assertGreater(plan["m2_ubicaciones"], 0)
+        por_zona = plan["por_zona"].set_index("zona")
+        self.assertGreater(por_zona.loc["Piso a granel", "ubicaciones_requeridas"], 0)
+        self.assertGreater(por_zona.loc["Rack angosto", "ubicaciones_requeridas"], 0)
+
+    def test_optimizador_prueba_acomodos_independientes_por_zona(self):
+        out = S.optimizar_por_zonas(
+            self.df, self.cfg, tipos=self.tipos, pasillo_m=3.0,
+            reglas={
+                "Piso a granel": {"zonas_fisicas": "PISO",
+                                    "modo_pasillo": "auto",
+                                    "orientacion": "automatica"},
+                "Rack angosto": {"zonas_fisicas": "RACK",
+                                  "modo_pasillo": "con",
+                                  "orientacion": "automatica"},
+            })
+        alternativas = out["alternativas_zona"]
+        piso = alternativas[alternativas["zona"] == "Piso a granel"]
+        rack = alternativas[alternativas["zona"] == "Rack angosto"]
+        self.assertEqual(set(piso["orientacion"]), {"horizontal", "vertical"})
+        self.assertEqual(set(piso["pasillo_m"]), {0.0, 3.0})
+        self.assertEqual(set(rack["orientacion"]), {"horizontal", "vertical"})
+        self.assertEqual(set(rack["pasillo_m"]), {3.0})
+        self.assertEqual(int(piso["seleccionada"].sum()), 1)
+        self.assertEqual(int(rack["seleccionada"].sum()), 1)
+        self.assertTrue(out["slots"])
+        self.assertIn("requeridas", out["por_zona"].columns)
+
     def test_cada_zona_recibe_ubicaciones_dentro_de_sus_limites(self):
         """Una ubicación fuera de su zona rompe el sentido de haberla dibujado."""
         out = self._generar()

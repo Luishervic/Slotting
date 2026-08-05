@@ -33,6 +33,10 @@ h2 { margin-top: 1.3rem !important; }
 }
 [data-testid="stMetricLabel"] { color: #94a3b8; }
 [data-testid="stMetricValue"] { color: #f8fafc; }
+[data-testid="stMetricValue"] > div {
+    font-size: clamp(1.35rem, 2vw, 2rem);
+    white-space: normal;
+}
 [data-baseweb="tab-list"] {
     gap: .25rem;
     border-bottom: 1px solid #243044;
@@ -49,6 +53,15 @@ h2 { margin-top: 1.3rem !important; }
 .stButton > button, .stDownloadButton > button {
     border-radius: 8px;
     min-height: 2.5rem;
+}
+.stButton > button[kind="primary"] {
+    background:#0284c7;
+    border-color:#0284c7;
+    color:#f8fafc;
+}
+.stButton > button[kind="primary"]:hover {
+    background:#0369a1;
+    border-color:#38bdf8;
 }
 [data-testid="stAlert"] { border-radius: 9px; }
 [data-testid="stDataFrame"] {
@@ -115,12 +128,12 @@ def estado_flujo() -> dict[str, bool]:
 def siguiente_paso() -> tuple[str, str]:
     estado = estado_flujo()
     if not estado["datos"]:
-        return "pages/1_Datos.py", "Definir datos y alcance"
+        return "pages/1_Datos.py", "Definir datos y demanda"
     if not estado["diseno"]:
-        return "pages/2_Diseno.py", "Diseñar y aplicar el layout"
+        return "pages/2_Diseno.py", "Diseñar y aplicar el almacén"
     if not estado["operacion"]:
-        return "pages/3_Operacion.py", "Simular y comparar métodos"
-    return "pages/4_Escenarios.py", "Revisar y comparar escenarios"
+        return "pages/3_Operacion.py", "Evaluar y comparar la operación"
+    return "pages/4_Escenarios.py", "Revisar el historial de análisis"
 
 
 def cambiar_pagina(destino: str) -> None:
@@ -173,7 +186,7 @@ def navegacion(actual: str | None = None) -> None:
     with st.sidebar:
         st.markdown(
             '<div class="workflow-label">Slotting CEDIS</div>'
-            '<div class="workflow-title">Menú principal</div>',
+            '<div class="workflow-title">Proyecto de slotting</div>',
             unsafe_allow_html=True,
         )
         try:
@@ -186,13 +199,12 @@ def navegacion(actual: str | None = None) -> None:
         except (KeyError, TypeError):
             st.caption(("→ " if actual == "inicio" else "") + "Inicio")
 
-        st.caption("Flujo de principio a fin")
+        st.caption("Tres decisiones, en orden")
         pasos = [
-            ("datos", "pages/1_Datos.py", "1. Datos y alcance", "📦"),
-            ("diseno", "pages/2_Diseno.py", "2. Diseñar layout", "🗺️"),
+            ("datos", "pages/1_Datos.py", "1. Datos y demanda", "📦"),
+            ("diseno", "pages/2_Diseno.py", "2. Diseñar almacén", "🗺️"),
             ("operacion", "pages/3_Operacion.py",
-             "3. Operación y métodos", "🚚"),
-            ("escenarios", "pages/4_Escenarios.py", "4. Escenarios", "🗂️"),
+             "3. Evaluar y decidir", "🚚"),
         ]
         for clave, destino, etiqueta, icono in pasos:
             bloqueado = (
@@ -214,18 +226,18 @@ def navegacion(actual: str | None = None) -> None:
                 )
 
         st.divider()
-        st.caption("Herramientas")
+        st.caption("Historial")
         try:
             st.page_link(
-                "pages/1_Validacion_de_datos.py",
-                label="Calidad de datos",
-                icon="🧹",
-                disabled=actual == "validacion",
+                "pages/4_Escenarios.py",
+                label="Análisis guardados",
+                icon="🗂️",
+                disabled=actual == "escenarios",
             )
         except (KeyError, TypeError):
             st.caption(
-                ("→ " if actual == "validacion" else "")
-                + "Calidad de datos"
+                ("→ " if actual == "escenarios" else "")
+                + "Análisis guardados"
             )
 
         st.divider()

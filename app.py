@@ -21,9 +21,9 @@ st.set_page_config(
 )
 navegacion("inicio")
 titulo_pagina(
-    "Menú principal",
+    "Proyecto",
     "Slotting CEDIS",
-    "Avanza de los datos a una decisión operativa siguiendo un solo flujo.",
+    "Prepara los datos, diseña el almacén y toma una decisión operativa.",
 )
 
 estado = estado_flujo()
@@ -51,18 +51,18 @@ with continuar:
 with resumen:
     st.metric(
         "Avance del flujo",
-        f"{sum(estado.values())} de 4 etapas ejecutadas",
+        f"{sum(estado[k] for k in ('datos', 'diseno', 'operacion'))} de 3 etapas",
     )
     st.metric("Escenarios guardados", f"{len(escenarios):,}")
 
-st.markdown("### Opciones principales")
-fila_1 = st.columns(2)
+st.markdown("### Flujo del proyecto")
+fila_1 = st.columns(3)
 tarjetas = [
     {
         "col": fila_1[0],
         "kicker": "Paso 1",
-        "title": "Datos y alcance",
-        "copy": "Selecciona la zona, valida dimensiones y confirma los SKU.",
+        "title": "Datos y demanda",
+        "copy": "Selecciona el origen, revisa calidad y confirma el objetivo.",
         "destino": "pages/1_Datos.py",
         "estado": "Completado" if estado["datos"] else "Disponible",
         "done": estado["datos"],
@@ -71,8 +71,8 @@ tarjetas = [
     {
         "col": fila_1[1],
         "kicker": "Paso 2",
-        "title": "Diseñar layout",
-        "copy": "Configura el área, genera alternativas y aplica el acomodo.",
+        "title": "Diseñar almacén",
+        "copy": "Calcula localidades, configura zonas y optimiza cada acomodo.",
         "destino": "pages/2_Diseno.py",
         "estado": "Completado" if estado["diseno"] else (
             "Disponible" if estado["datos"] else "Requiere paso 1"
@@ -80,14 +80,11 @@ tarjetas = [
         "done": estado["diseno"],
         "disabled": not estado["datos"],
     },
-]
-fila_2 = st.columns(2)
-tarjetas.extend([
     {
-        "col": fila_2[0],
+        "col": fila_1[2],
         "kicker": "Paso 3",
-        "title": "Operación y métodos",
-        "copy": "Simula el surtido, compara métodos y anima los mejores.",
+        "title": "Evaluar y decidir",
+        "copy": "Compara la operación y entiende la recomendación.",
         "destino": "pages/3_Operacion.py",
         "estado": "Completado" if estado["operacion"] else (
             "Disponible" if estado["diseno"] else "Requiere paso 2"
@@ -95,20 +92,7 @@ tarjetas.extend([
         "done": estado["operacion"],
         "disabled": not estado["diseno"],
     },
-    {
-        "col": fila_2[1],
-        "kicker": "Paso 4",
-        "title": "Escenarios",
-        "copy": "Consulta versiones guardadas y compara sus resultados.",
-        "destino": "pages/4_Escenarios.py",
-        "estado": (
-            f"{len(escenarios):,} guardados"
-            if len(escenarios) else "Sin escenarios"
-        ),
-        "done": bool(len(escenarios)) or estado["escenarios"],
-        "disabled": False,
-    },
-])
+]
 
 for tarjeta in tarjetas:
     with tarjeta["col"]:
@@ -131,12 +115,12 @@ for tarjeta in tarjetas:
         )
 
 st.divider()
-st.markdown("### Herramienta auxiliar")
+st.markdown("### Historial")
 st.caption(
-    "Revisa valores atípicos, dimensiones y peso antes de confirmar el diseño."
+    "Consulta versiones guardadas sin convertir el historial en otro paso del flujo."
 )
 st.page_link(
-    "pages/1_Validacion_de_datos.py",
-    label="Abrir calidad de datos",
-    icon="🧹",
+    "pages/4_Escenarios.py",
+    label=f"Abrir análisis guardados ({len(escenarios):,})",
+    icon="🗂️",
 )

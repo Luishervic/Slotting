@@ -1,4 +1,4 @@
-"""Paso 4 — Consulta y comparación de escenarios persistidos."""
+"""Historial transversal de análisis persistidos."""
 from __future__ import annotations
 
 import pandas as pd
@@ -16,9 +16,9 @@ st.set_page_config(
 )
 navegacion("escenarios")
 titulo_pagina(
-    "Paso 4 de 4",
-    "Escenarios",
-    "Consulta versiones inmutables y compara sus resultados.",
+    "Historial del proyecto",
+    "Análisis guardados",
+    "Consulta versiones inmutables y compara resultados anteriores.",
 )
 
 store = ScenarioStore(SCENARIO_DB)

@@ -163,7 +163,20 @@ menos pasillos. La pestaña **🚧 Interferencia** muestra el mapa de congestió
 por tramo, el reparto de uso del andén, y a partir de cuántos operadores la nave
 deja de absorber gente.
 
-## Zonas: cada área con sus propias reglas
+## Capacidad por mercancía y zonas con reglas propias
+
+El diseño empieza por la necesidad, no por la geometría. Para cada
+`zona_fisica`, `capacidad_zonas.calcular_capacidad_por_zona_fisica` toma la
+estructura declarada en `catalogo_estructuras_zona.csv`, prueba de uno a varios
+tipos de localidad y recomienda el catálogo que usa menos huella. Si una opción
+con menos tipos queda a menos de 3% del mínimo, se prefiere la más simple para
+no fragmentar capacidad por un ahorro marginal. Los códigos quedan ligados a
+la mercancía (`ACU-…`, `CEL-…`) y no se mezclan accidentalmente entre perfiles.
+
+En rack se reportan dos cantidades distintas: **localidades lógicas** por nivel
+y subdivisión, y **módulos físicos** que ocupan el piso. El modo opcional de
+frente y reserva usa el punto de reorden para separar ambas capacidades sin
+perder unidades.
 
 Un layout no es homogéneo. Un área de piso a granel se aprovecha **sin pasillo**,
 pegando las hileras; una franja alta y angosta rinde más con las ubicaciones en
@@ -189,10 +202,10 @@ Tres cosas que conviene conocer:
   vio—: es monótono y no puede pasarse. Estimarlo por capacidad teórica vaciaba
   el catálogo en las dos primeras zonas y dejaba sin mercancía a las demás
   aunque tuvieran espacio de sobra.
-- **El orden de trabajo es el natural.** Primero se define el espacio —importar
-  el plano, dibujar las zonas—, después se les dan sus reglas, y sólo entonces
-  se generan las ubicaciones. La propuesta se apoya en el espacio ya definido en
-  vez de suponerlo.
+- **El orden de trabajo es el natural.** Primero se calculan localidades y
+  módulos por mercancía; después se dibuja el espacio, se vincula cada área con
+  uno de esos perfiles y finalmente se prueban orientación y pasillos dentro de
+  cada zona. La capacidad solicitada y lo que realmente cabe permanecen visibles.
 
 ## Alcance de varias zonas físicas
 
