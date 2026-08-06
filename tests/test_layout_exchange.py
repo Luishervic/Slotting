@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import io
 import unittest
+import xml.etree.ElementTree as ET
+import zipfile
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -43,20 +45,29 @@ class TestLayoutExchange(unittest.TestCase):
              "localidades_necesarias": 1},
         ]
 
-    def test_libro_muestra_solo_dashboard_tipos_y_mapa(self):
+    def test_libro_separa_boceto_editable_y_resultado_restringido(self):
         datos = LX.exportar_excel(
             self.slots, self.zonas, self.tipos, self.df, 10, 8, .5,
             requerimientos=self.requerimientos)
         wb = load_workbook(io.BytesIO(datos))
         visibles = [ws.title for ws in wb.worksheets
                     if ws.sheet_state == "visible"]
-        self.assertEqual(visibles,
-                         ["Dashboard", "Tipos_ubicacion", "Mapa_colocacion"])
+        self.assertEqual(visibles, [
+            "Dashboard", "Tipos_ubicacion", "Mapa_preliminar",
+            "Mapa_restringido"])
         self.assertEqual(wb["Zonas"].sheet_state, "hidden")
         self.assertEqual(wb["Localidades"].sheet_state, "hidden")
-        mapa = wb["Mapa_colocacion"]
+        mapa = wb["Mapa_preliminar"]
         self.assertTrue(mapa.protection.sheet)
-        self.assertIn("automáticamente", mapa["A2"].value)
+        self.assertIn("asignará", mapa["A2"].value)
+        restringido = wb["Mapa_restringido"]
+        self.assertTrue(restringido.protection.sheet)
+        self.assertIn("huellas muestran ancho y fondo reales",
+                      restringido["A2"].value)
+        celdas_tipo = sum(
+            c.fill.fgColor.rgb in {"0022C55E", "22C55E"}
+            for row in restringido.iter_rows() for c in row)
+        self.assertGreaterEqual(celdas_tipo, 6)
         self.assertEqual(list(wb["Localidades"].tables), ["tblLocalidades"])
         self.assertEqual(list(wb["Relacion_SKU_Localidad"].tables),
                          ["tblRelacionSkuLocalidad"])
@@ -72,6 +83,26 @@ class TestLayoutExchange(unittest.TestCase):
         self.assertIn("COUNTIFS", wb["SKU_por_designar"]["L2"].value)
         self.assertEqual(wb["Localidades"]["S2"].value,
                          '=IF(OR(A2="",C2="",D2="",E2="",F2="",G2="",H2=""),"PENDIENTE","PREPARADA")')
+
+    def test_tablas_no_superponen_autofiltro_de_hoja(self):
+        datos = LX.exportar_excel(
+            self.slots, self.zonas, self.tipos, self.df, 10, 8, .5,
+            requerimientos=self.requerimientos)
+        ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+        with zipfile.ZipFile(io.BytesIO(datos)) as paquete:
+            tablas = [nombre for nombre in paquete.namelist()
+                      if nombre.startswith("xl/tables/table")]
+            self.assertEqual(len(tablas), 5)
+            for nombre in paquete.namelist():
+                if not (nombre.startswith("xl/worksheets/sheet")
+                        and nombre.endswith(".xml")):
+                    continue
+                raiz = ET.fromstring(paquete.read(nombre))
+                tiene_tabla = raiz.find(f"{ns}tableParts") is not None
+                tiene_filtro_hoja = raiz.find(f"{ns}autoFilter") is not None
+                self.assertFalse(
+                    tiene_tabla and tiene_filtro_hoja,
+                    f"{nombre} contiene tabla y AutoFilter de hoja superpuestos")
 
     def test_ida_y_vuelta_preserva_geometria_y_restricciones(self):
         datos = LX.exportar_excel(self.slots, self.zonas, self.tipos, self.df,
@@ -116,7 +147,7 @@ class TestLayoutExchange(unittest.TestCase):
             pendientes, self.zonas, self.tipos, self.df, 10, 8, .5,
             requerimientos=self.requerimientos)
         wb = load_workbook(io.BytesIO(datos))
-        ws = wb["Mapa_colocacion"]
+        ws = wb["Mapa_preliminar"]
         fila_coord = next(r for r in range(1, ws.max_row + 1)
                           if ws.cell(r, 1).value == "Y \\ X")
         col = next(c for c in range(2, ws.max_column + 1)

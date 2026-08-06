@@ -1,0 +1,37 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Prueba del editor de localidades</title>
+<style>html,body,iframe{border:0;margin:0;width:100%;height:100%}</style>
+<iframe id="editor" src="../../slotting/cad_editor_frontend/index.html"></iframe>
+<script>
+const args={ancho:30,largo:20,rejilla:.25,modo_localidades:true,
+  perimetro:[{x:0,y:0},{x:30,y:0},{x:30,y:20},{x:0,y:20}],
+  obstaculos:[{nombre:'Columna',tipo:'zona_bloqueada',x:14,y:8,w:2,d:2}],
+  accesos:[{nombre:'Entrada',tipo:'entrada',x:0,y:8,w:1,d:4}],
+  zonas:[
+    {nombre:'Motos',x:1,y:1,w:13,d:18,prioridad:1,
+     tipos:['MOTO-PISO'],departamentos:['MOTOS']},
+    {nombre:'Rack',x:16,y:1,w:13,d:18,prioridad:2,tipos:['RACK-M']}],
+  ubicaciones:[],
+  tipos:[
+    {codigo:'MOTO-PISO',tipo:'Moto en piso',w:2.2,d:.9,h:1.4,
+     tipo_estructura:'PISO'},
+    {codigo:'RACK-M',tipo:'Rack medio',w:2.4,d:1.1,h:6,
+     tipo_estructura:'RACK'}],
+  presupuesto:[
+    {codigo:'MOTO-PISO',nombre:'Moto en piso',w:2.2,d:.9,h:1.4,
+     estructura:'PISO',requeridas:8},
+    {codigo:'RACK-M',nombre:'Rack medio',w:2.4,d:1.1,h:6,
+     estructura:'RACK',requeridas:10}],
+  localidades_planificadas:[
+    ...Array.from({length:8},(_,i)=>({id:`MOTO-${String(i+1).padStart(3,'0')}`,
+      tipo_codigo:'MOTO-PISO',zona_layout:'Motos',w:2.2,d:.9})),
+    ...Array.from({length:10},(_,i)=>({id:`RACK-${String(i+1).padStart(3,'0')}`,
+      tipo_codigo:'RACK-M',zona_layout:'Rack',w:2.4,d:1.1}))]};
+addEventListener('message',event=>{
+  if(event.data?.type==='streamlit:componentReady')
+    event.source.postMessage({type:'streamlit:render',args},'*');
+  if(event.data?.type==='streamlit:setComponentValue')
+    document.title=`Guardado ${event.data.value?.ubicaciones?.length??0}`;
+});
+</script>

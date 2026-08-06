@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 
 from slotting.design_workspace import (ETAPAS, _indicadores_designacion,
+                                       _presupuesto_editor,
                                        _relaciones_sugeridas)
 
 
@@ -51,6 +52,18 @@ class TestFlujoMercanciaPrimero(unittest.TestCase):
             {"id_localidad": "L1", "sku": "A"},
             {"id_localidad": "L2", "sku": "C"},
         ])
+
+    def test_presupuesto_editor_cuenta_localidades_por_tipo(self):
+        out = _presupuesto_editor(
+            [{"tipo_codigo": "T1"}, {"tipo_codigo": "T1"},
+             {"tipo_codigo": "T2"}],
+            [{"codigo": "T1", "tipo": "Compacta", "w": 1.2,
+              "d": .8, "h": 1.5, "zona_fisica": "PISO"},
+             {"codigo": "T2", "tipo": "Rack", "w": 2.4,
+              "d": 1.1, "h": 6, "tipo_estructura": "RACK"}])
+        self.assertEqual(out[0]["requeridas"], 2)
+        self.assertEqual(out[1]["requeridas"], 1)
+        self.assertEqual(out[1]["estructura"], "RACK")
 
 
 if __name__ == "__main__":

@@ -64,11 +64,9 @@ Flujo de usuario:
 
 1. **Inicio:** muestra el avance y lleva automáticamente al siguiente paso.
 2. **Datos y alcance:** elegir zona física, validar y confirmar los SKU.
-3. **Diseñar almacén:** analizar primero la mercancía para estandarizar los
-   tipos de localidad X/Y/Z; después importar o dibujar el plano y declarar en
-   cada zona mercancía, estructura, pasillos, orientación y restricciones.
-   Por último se calcula cuántas localidades necesita cada SKU y se genera el
-   libro de preparación para que el usuario decida el acomodo y lo reimporte.
+3. **Diseñar layout:** calcular tipos de ubicación con dimensiones X/Y/Z,
+   importar el plano CAD y definir mercancía, estructura, pasillos,
+   orientación y restricciones desde el inspector gráfico de cada zona.
 4. **Operación y métodos:** simular el surtido sobre ese layout, comparar
    métodos —discreto, lotes, cluster, zonas, oleadas—, animar los mejores y
    medir la interferencia entre operadores.
@@ -110,19 +108,17 @@ ancho, fondo y alto útil. Cambiar existencias o ABC no altera esas medidas;
 sólo altera cantidades y posición.
 
 El diseño se divide en tres vistas: análisis de mercancía, restricciones por
-zona y preparación de localidades. El plano es la fuente geométrica. El libro
-XLSX sólo presenta tres hojas al usuario: `Dashboard`, `Tipos_ubicacion` y
-`Mapa_colocacion`. En el mapa se escribe un tipo por ancla —con `|V` para
-girarlo— y el saldo requerido/colocado/restante se actualiza en vivo. Las
-tablas normalizadas de SKU, localidades, relaciones, zonas y validaciones
-permanecen ocultas; al reimportar, la aplicación reconstruye la geometría y
-asigna automáticamente la mercancía compatible con las restricciones del CAD.
+zona y preparación de localidades. El plano es ahora la fuente principal del
+acomodo: una paleta muestra cada tipo, sus dimensiones X/Y/Z y su saldo; sobre
+el lienzo se coloca una localidad o se traza una corrida de uno o dos lados con
+pasillo. La validación de perímetro, zona permitida, obstáculos y traslapes se
+actualiza antes de guardar. Las restricciones de mercancía se heredan de la
+zona y pueden afinarse en el inspector de una localidad.
 
-Antes de aplicar el XLSX o ejecutar el motor, `slotting/layout_artifacts.py`
-valida llaves ID/WMS, límites, pertenencia a zona, tipos, obstáculos y
-traslapes. `Mapa_colocacion` es la entrada gráfica del libro; después de
-reimportarlo, la geometría validada regenera un SVG vectorial y un PDF
-imprimible a escala.
+El XLSX queda como intercambio, auditoría y captura masiva. Conserva
+`Dashboard`, `Tipos_ubicacion`, `Mapa_preliminar` y `Mapa_restringido`; al
+reimportarlo se valida la geometría, se asigna la mercancía compatible y se
+regenera la representación física. Las tablas normalizadas permanecen ocultas.
 
 ## Importar el plano de la nave
 
@@ -300,8 +296,7 @@ operadores en un mismo pasillo y el costo de supervisión. La columna de
 simplicidad operativa es juicio, no dato.
 
 La animación (`slotting/animacion.py`) reproduce hasta tres métodos en paneles
-que **comparten un solo reloj**: es el mismo instante simulado en los tres, así
-que cuando un panel ya vació su tablero y otro sigue caminando, la diferencia se
+que **comparten un solo reloj**: es el mismo instante simulado en los tres, así que cuando un panel ya vació su tablero y otro sigue caminando, la diferencia se
 ve sin leer ninguna tabla. La línea de tiempo la produce el motor de eventos; el
 navegador sólo interpola posiciones.
 
@@ -479,16 +474,18 @@ Una zona que falla no tumba el barrido: se reporta y se sigue.
 
 ## CAD y visor 3D
 
-- El editor CAD utiliza un plano SVG 2D directo; el visor 3D utiliza Three.js.
-  Ambos comparten el mismo contrato de datos.
+- El editor de zonas utiliza SVG; la distribución de localidades utiliza
+  Konva.js 10.3.0 sobre Canvas y el visor 3D utiliza Three.js. Los tres comparten
+  el mismo contrato JSON métrico con Python.
 - El CAD permite perímetros irregulares, zonas poligonales, obstáculos, drops,
   accesos y ubicaciones con selección y arrastre directos, ajuste a rejilla y
   alineación inteligente.
-- Los rectángulos se redimensionan con medidas numéricas y se mueven
-  directamente sobre el plano, como en el editor CAD original.
+- En la etapa de localidades hay paleta por tipo, orientación horizontal o
+  vertical, colocación individual, corridas paramétricas, selección múltiple,
+  rotación, duplicado, deshacer/rehacer y conteos de avance en vivo.
 - Los rerenders de Streamlit conservan el borrador local hasta guardarlo o
   descartarlo explícitamente.
-- Los cambios permanecen como borrador hasta pulsar **Guardar borrador CAD**.
+- Los cambios permanecen como borrador hasta pulsar **Guardar layout**.
 - El visor 3D representa mercancía con instancias WebGL y agrupa la estructura de
   rack para sostener layouts con miles de posiciones.
 - Los racks distinguen montantes azules, largueros naranjas y plataformas,
@@ -544,9 +541,9 @@ slotting/comparador.py       Barrido de escenarios y score compuesto
 slotting/trazas.py           Un pedido trazado por varias metodologías
 slotting/viz.py              Plano 2D y construcción 3D
 barrido_zonas.py             Barrido por lotes de todas las zonas
-slotting/cad_editor.py        Puente Streamlit del editor CAD SVG
+slotting/cad_editor.py        Puente Streamlit de los editores 2D
 slotting/three_viewer.py      Serialización y visor WebGL
-slotting/cad_editor_frontend/ Editor CAD SVG
+slotting/cad_editor_frontend/ Editor SVG de zonas y Canvas/Konva de localidades
 slotting/cad_frontend/        Visor 3D Three.js
 generar_reglas_sku_zonas.py
 datos/cedis/<CODIGO>/reglas_sku_*_final.csv

@@ -1,6 +1,7 @@
 """Espacio de trabajo lineal para diseñar tipos, zonas y localidades."""
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
@@ -189,7 +190,10 @@ def _aplicar_editor(valor: dict | None) -> None:
     st.session_state["slots"] = slots
 
 
-def _editor(df: pd.DataFrame, key: str, *, incluir_tipos: bool = True) -> None:
+def _editor(df: pd.DataFrame, key: str, *, incluir_tipos: bool = True,
+            modo_localidades: bool = False,
+            localidades_planificadas: list[dict] | None = None,
+            presupuesto: list[dict] | None = None) -> None:
     valor = editor_cad(
         st.session_state["perimetro"], st.session_state["obstaculos"],
         st.session_state["accesos"], st.session_state["zonas_layout"],
@@ -197,7 +201,9 @@ def _editor(df: pd.DataFrame, key: str, *, incluir_tipos: bool = True) -> None:
         st.session_state["largo_m"], st.session_state["cad_rejilla"],
         tipos=(st.session_state.get("tipos_catalogo", [])
                if incluir_tipos else []),
-        catalogos=_catalogos(df), key=key)
+        catalogos=_catalogos(df),
+        localidades_planificadas=localidades_planificadas,
+        presupuesto=presupuesto, modo_localidades=modo_localidades, key=key)
     _aplicar_editor(valor)
 
 
@@ -491,6 +497,28 @@ def _localidades_planificadas(plan: dict) -> list[dict]:
     return slots
 
 
+def _presupuesto_editor(localidades: list[dict],
+                        tipos: list[dict]) -> list[dict]:
+    """Resume el objetivo físico que consume la paleta del editor CAD."""
+    requeridas = Counter(str(s.get("tipo_codigo") or "") for s in localidades)
+    salida = []
+    for tipo in tipos:
+        codigo = str(tipo.get("codigo") or "")
+        if not codigo:
+            continue
+        salida.append({
+            "codigo": codigo,
+            "nombre": str(tipo.get("tipo") or tipo.get("talla") or codigo),
+            "w": float(tipo.get("w") or 0),
+            "d": float(tipo.get("d") or 0),
+            "h": float(tipo.get("h") or 0),
+            "zona_fisica": str(tipo.get("zona_fisica") or ""),
+            "estructura": str(tipo.get("tipo_estructura") or "PISO"),
+            "requeridas": int(requeridas.get(codigo, 0)),
+        })
+    return salida
+
+
 def _relaciones_sugeridas(localidades: list[dict],
                            requerimientos: list[dict]) -> list[dict]:
     """Prepara la cola informativa de SKU; el motor la confirma al importar."""
@@ -587,9 +615,9 @@ def _mostrar_validacion(reporte: dict, *, detalle: bool = True) -> None:
 def _vista_localidades(df: pd.DataFrame) -> None:
     st.subheader("Preparar localidades y relacionarlas con los SKU")
     st.caption(
-        "El sistema calcula cuánto se necesita. Tú sólo distribuyes los tipos "
-        "sobre el mapa de Excel; al reimportarlo se reconstruyen las localidades "
-        "y se asignan automáticamente los SKU compatibles.")
+        "El sistema calcula cuánto se necesita. Distribuyes los tipos en el "
+        "mapa preliminar; al reimportar se asignan los SKU compatibles y se "
+        "genera el mapa restringido con su tamaño físico real.")
     if not st.session_state.get("tipos_catalogo"):
         st.warning("Primero analiza la mercancía y aprueba los tipos de localidad.")
         return
@@ -628,15 +656,39 @@ def _vista_localidades(df: pd.DataFrame) -> None:
     with st.expander("Necesidad calculada por zona", expanded=False):
         st.dataframe(plan["por_zona"], hide_index=True, width="stretch")
 
-    st.markdown("#### Libro para preparar el acomodo")
+    st.markdown("#### Distribuir localidades sobre el plano")
     st.caption(
-        "Sólo verás Dashboard, Tipos_ubicacion y Mapa_colocacion. En el mapa "
-        "distribuyes tipos; el saldo se actualiza solo y el motor asigna los "
-        "SKU compatibles al reimportar.")
+        "Selecciona un tipo de la paleta y colócalo individualmente o traza "
+        "una corrida. El editor usa sus medidas físicas reales y actualiza "
+        "en vivo lo colocado, lo pendiente, el área ocupada y los conflictos.")
+    presupuesto = _presupuesto_editor(
+        plantilla, st.session_state["tipos_catalogo"])
+    _editor(
+        df, f"cad_localidades_{st.session_state.get('slots_rev', 0)}",
+        modo_localidades=True, localidades_planificadas=plantilla,
+        presupuesto=presupuesto)
+    actuales = [s for s in st.session_state.get("slots", [])
+                if s.get("activa", True)]
+    validacion = _validacion_actual(actuales)
+    if actuales:
+        with st.expander(
+                f"Validación geométrica · {validacion['errores']} errores · "
+                f"{validacion['advertencias']} advertencias",
+                expanded=not validacion["valido"]):
+            _mostrar_validacion(validacion)
+    else:
+        st.info(
+            "Aún no hay localidades colocadas. Selecciona un tipo en la "
+            "paleta y usa Colocar o Corrida sobre el plano.")
+
+    st.markdown("#### Excel para intercambio y auditoría")
+    st.caption(
+        "Verás Dashboard, Tipos_ubicacion, Mapa_preliminar y Mapa_restringido. "
+        "Puede seguirse usando para captura masiva o revisión; la fuente "
+        "principal del acomodo es ahora el editor visual anterior.")
     escala = st.select_slider("Resolución gráfica del mapa", [.25, .5, 1.0, 2.0],
                               value=.5,
                               format_func=lambda x: f"Separación ≈ {x:g} m")
-    validacion = _validacion_actual(actuales)
     libro = _xlsx(
         tuple(localidades_excel), tuple(st.session_state["zonas_layout"]),
         tuple(st.session_state["tipos_catalogo"]), df,
@@ -696,21 +748,6 @@ def _vista_localidades(df: pd.DataFrame) -> None:
                     f"{len(relaciones_auto):,} asignaciones compatibles generadas "
                     "automáticamente.")
                 st.rerun()
-    if not actuales:
-        st.info(
-            "Aún no hay localidades colocadas. Distribuye códigos de tipo en "
-            "Mapa_colocacion y reimpórtalo para habilitar el plano y el motor.")
-        return
-
-    st.markdown("#### Revisión gráfica de las localidades preparadas")
-    _editor(df, f"cad_localidades_{st.session_state.get('slots_rev', 0)}")
-    actuales = [s for s in st.session_state["slots"] if s.get("activa", True)]
-    validacion = _validacion_actual(actuales)
-    with st.expander(
-            f"Validación geométrica · {validacion['errores']} errores · "
-            f"{validacion['advertencias']} advertencias",
-            expanded=not validacion["valido"]):
-        _mostrar_validacion(validacion)
     with st.expander("Representaciones visuales a escala", expanded=False):
         st.caption("SVG y PDF se generan sólo con las localidades ya preparadas.")
         escala_salida = st.selectbox("Escala vectorial", [100, 200, 500],
@@ -762,7 +799,7 @@ def render() -> None:
     st.set_page_config(page_title="Diseñar almacén", page_icon="🏗️", layout="wide")
     navegacion("diseno")
     titulo_pagina("Paso 2 de 3", "Diseñar almacén",
-                  "Analiza la mercancía, restringe cada zona y prepara el acomodo de las localidades en Excel.")
+                  "Analiza la mercancía, restringe cada zona y distribuye las localidades directamente sobre el plano.")
     if "df" not in st.session_state:
         st.warning("Primero carga y confirma los datos de mercancía.")
         st.stop()

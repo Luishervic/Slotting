@@ -1,9 +1,9 @@
 """Intercambio simplificado del layout entre la aplicación y Excel.
 
-El usuario sólo administra tres hojas visibles: avance, tipos y un mapa de
-colocación. Las tablas normalizadas permanecen ocultas como contrato técnico;
-la aplicación reconstruye las coordenadas y asigna los SKU compatibles al
-reimportar el mapa.
+El usuario administra cuatro hojas visibles: avance, tipos, un boceto editable
+y el último resultado físico restringido. Las tablas normalizadas permanecen
+ocultas como contrato técnico; la aplicación reconstruye las coordenadas,
+asigna los SKU compatibles y regenera el resultado al reimportar el boceto.
 """
 from __future__ import annotations
 
@@ -81,6 +81,10 @@ def _tabla_excel(ws, nombre: str, ncols: int) -> None:
     if ws.max_row < 2:
         return
     ref = f"A1:{get_column_letter(ncols)}{ws.max_row}"
+    # La tabla ya incorpora su propio AutoFilter. Mantener además el filtro
+    # de hoja sobre el mismo rango produce dos filtros superpuestos; Excel
+    # repara el archivo eliminando la tabla completa.
+    ws.auto_filter.ref = None
     tabla = Table(displayName=nombre, ref=ref)
     tabla.tableStyleInfo = TableStyleInfo(
         name="TableStyleMedium2", showFirstColumn=False,
@@ -98,8 +102,8 @@ def _crear_instrucciones(wb: Workbook, escala_m: float) -> None:
     ws["A1"].font = Font(color=BLANCO, bold=True, size=18)
     ws["A1"].alignment = Alignment(vertical="center")
     filas = [
-        (4, "Orden recomendado", "1) Revisa SKU_por_designar. 2) Prepara coordenadas y códigos en Localidades. 3) Relaciona cada localidad con uno o más SKU. 4) Revisa Dashboard y Mapa_escala. 5) Guarda y reimporta."),
-        (6, "Fuente de verdad", "Localidades, Zonas y Relacion_SKU_Localidad son reimportables. Dashboard, Validacion y Mapa_escala son vistas derivadas."),
+        (4, "Orden recomendado", "1) Revisa Dashboard y Tipos_ubicacion. 2) Distribuye tipos en Mapa_preliminar. 3) Guarda y reimporta. 4) Descarga de nuevo para revisar Mapa_restringido."),
+        (6, "Fuente de verdad", "Mapa_preliminar es la entrada editable. Mapa_restringido refleja el último resultado validado; las tablas de soporte permanecen ocultas."),
         (8, "Escala del mapa", f"Cada celda representa aproximadamente {escala_m:g} m × {escala_m:g} m. Sirve para comprobar proporciones, no para sustituir coordenadas."),
         (10, "Restricciones", "Vacío significa libre. Se pueden restringir localidades por ABC, departamento, clase, familia o zona física."),
         (12, "Códigos", "id_localidad es la llave técnica y no debe repetirse. En Relacion_SKU_Localidad puede repetirse para permitir que una localidad multi-SKU reciba varios códigos."),
@@ -298,12 +302,12 @@ def _crear_dashboard(wb: Workbook, sku_fin: int, mapa: dict) -> None:
     resumen_ini, resumen_fin = mapa["resumen_inicio"], mapa["resumen_fin"]
     indicadores = [
         ("A4", "SKU por designar", f"=COUNTA('SKU_por_designar'!$A$2:$A${sku_fin})"),
-        ("C4", "Tipos de localidad", f"=COUNTA('Mapa_colocacion'!$A${resumen_ini}:$A${resumen_fin})"),
-        ("E4", "Localidades requeridas", f"=SUM('Mapa_colocacion'!$B${resumen_ini}:$B${resumen_fin})"),
-        ("G4", "Localidades colocadas", f"=SUM('Mapa_colocacion'!$C${resumen_ini}:$C${resumen_fin})"),
-        ("A8", "Localidades pendientes", f'=SUMIF(\'Mapa_colocacion\'!$D${resumen_ini}:$D${resumen_fin},">0")'),
+        ("C4", "Tipos de localidad", f"=COUNTA('Mapa_preliminar'!$A${resumen_ini}:$A${resumen_fin})"),
+        ("E4", "Localidades requeridas", f"=SUM('Mapa_preliminar'!$B${resumen_ini}:$B${resumen_fin})"),
+        ("G4", "Localidades colocadas", f"=SUM('Mapa_preliminar'!$C${resumen_ini}:$C${resumen_fin})"),
+        ("A8", "Localidades pendientes", f'=SUMIF(\'Mapa_preliminar\'!$D${resumen_ini}:$D${resumen_fin},">0")'),
         ("C8", "Cobertura del mapa", "=IF(E5=0,0,G5/E5)"),
-        ("E8", "Tipos con exceso", f'=COUNTIF(\'Mapa_colocacion\'!$D${resumen_ini}:$D${resumen_fin},"<0")'),
+        ("E8", "Tipos con exceso", f'=COUNTIF(\'Mapa_preliminar\'!$D${resumen_ini}:$D${resumen_fin},"<0")'),
         ("G8", "Asignación de SKU", '="Automática al reimportar"'),
     ]
     for celda, titulo, formula in indicadores:
@@ -321,9 +325,9 @@ def _crear_dashboard(wb: Workbook, sku_fin: int, mapa: dict) -> None:
                        end_row=row + 1, end_column=col + 1)
     ws["C9"].number_format = "0%"
     ws.merge_cells("A12:H13")
-    ws["A12"] = ("Trabaja únicamente en Mapa_colocacion: escribe el código del tipo "
-                   "en cada celda permitida. El saldo se actualiza en vivo y, al "
-                   "reimportar, el motor asigna automáticamente los SKU compatibles.")
+    ws["A12"] = ("Distribuye tipos en Mapa_preliminar. Después reimporta el libro: "
+                   "la aplicación asigna SKU, valida restricciones y regenera "
+                   "Mapa_restringido con las dimensiones físicas reales.")
     ws["A12"].alignment = Alignment(wrap_text=True, vertical="center")
     ws["A12"].fill = PatternFill("solid", fgColor=AMARILLO)
     for col in "ABCDEFGH":
@@ -433,14 +437,14 @@ def _punto_en_rectangulo(x: float, y: float, item: dict) -> bool:
             and float(item["y"]) <= y < float(item["y"]) + float(item["d"]))
 
 
-def _crear_mapa(wb: Workbook, slots: list[dict], zonas: list[dict],
-                tipos: list[dict], ancho_m: float, largo_m: float,
-                escala_m: float, relacion_fin: int,
-                validacion: dict | None = None, perimetro=None,
-                obstaculos: list[dict] | None = None,
-                accesos: list[dict] | None = None) -> dict:
+def _crear_mapa_preliminar(wb: Workbook, slots: list[dict], zonas: list[dict],
+                           tipos: list[dict], ancho_m: float, largo_m: float,
+                           escala_m: float, relacion_fin: int,
+                           validacion: dict | None = None, perimetro=None,
+                           obstaculos: list[dict] | None = None,
+                           accesos: list[dict] | None = None) -> dict:
     """Crea el único editor visible: una ancla por localidad colocada."""
-    ws = wb.create_sheet("Mapa_colocacion")
+    ws = wb.create_sheet("Mapa_preliminar")
     ws.sheet_view.showGridLines = False
     escala = max(0.2, float(escala_m))
     nx = min(800, max(1, int(math.ceil(float(ancho_m) / escala))))
@@ -457,12 +461,13 @@ def _crear_mapa(wb: Workbook, slots: list[dict], zonas: list[dict],
 
     ws.merge_cells(start_row=1, start_column=1, end_row=1,
                    end_column=min(max(6, col_fin), 12))
-    ws["A1"] = "Mapa gráfico de colocación"
+    ws["A1"] = "Mapa preliminar · boceto editable"
     ws["A1"].font = Font(bold=True, size=17, color=BLANCO)
     ws["A1"].fill = PatternFill("solid", fgColor=AZUL)
     ws["A2"] = (f"Cada celda representa una ancla aproximada de {escala:g} m. "
                  "Escribe el tipo (por ejemplo T01) o T01|V para girarlo. "
-                 "El SKU compatible se asignará automáticamente al reimportar.")
+                 "El SKU compatible se asignará al reimportar; consulta el "
+                 "tamaño físico confirmado en Mapa_restringido.")
     ws.merge_cells(start_row=2, start_column=1, end_row=2,
                    end_column=min(max(6, col_fin), 12))
     ws["A2"].alignment = Alignment(wrap_text=True)
@@ -570,6 +575,119 @@ def _crear_mapa(wb: Workbook, slots: list[dict], zonas: list[dict],
             "escala": escala}
 
 
+def _crear_mapa_restringido(wb: Workbook, slots: list[dict], zonas: list[dict],
+                            tipos: list[dict], ancho_m: float, largo_m: float,
+                            escala_m: float, validacion: dict | None = None,
+                            perimetro=None, obstaculos: list[dict] | None = None,
+                            accesos: list[dict] | None = None) -> None:
+    """Dibuja el último resultado validado con huellas físicas reales."""
+    ws = wb.create_sheet("Mapa_restringido")
+    ws.sheet_view.showGridLines = False
+    escala = max(0.2, float(escala_m))
+    nx = min(800, max(1, int(math.ceil(float(ancho_m) / escala))))
+    ny = min(800, max(1, int(math.ceil(float(largo_m) / escala))))
+    ws.merge_cells(start_row=1, start_column=1, end_row=1,
+                   end_column=min(max(6, nx + 1), 12))
+    ws["A1"] = "Mapa restringido · resultado físico validado"
+    ws["A1"].font = Font(bold=True, size=17, color=BLANCO)
+    ws["A1"].fill = PatternFill("solid", fgColor=AZUL)
+    completas = [s for s in slots
+                 if all(s.get(k) is not None for k in ("x", "y", "w", "d"))]
+    ws.merge_cells(start_row=2, start_column=1, end_row=2,
+                   end_column=min(max(6, nx + 1), 12))
+    ws["A2"] = (
+        f"Escala: 1 celda ≈ {escala:g} m · {len(completas):,} localidades. "
+        + ("Las huellas muestran ancho y fondo reales."
+           if completas else
+           "Aún no hay localidades validadas: edita Mapa_preliminar, reimporta y descarga de nuevo."))
+    ws["A2"].alignment = Alignment(wrap_text=True)
+    ws.row_dimensions[2].height = 30
+    fila_coord, fila_inicio = 3, 4
+    for ix in range(nx):
+        col = ix + 2
+        ws.cell(fila_coord, col, round(ix * escala, 2))
+        ws.cell(fila_coord, col).font = Font(size=7, color="475569")
+        ws.column_dimensions[get_column_letter(col)].width = 2.14
+    for iy in range(ny):
+        row = fila_inicio + iy
+        ws.cell(row, 1, round((ny - 1 - iy) * escala, 2))
+        ws.cell(row, 1).font = Font(size=7, color="475569")
+        ws.row_dimensions[row].height = 15
+    ws["A3"] = "Y \\ X"
+    ws["A3"].font = Font(bold=True, color=AZUL)
+    ws.column_dimensions["A"].width = 10
+
+    zona_colores = ["E0F2FE", "EDE9FE", "DCFCE7", "FEF3C7", "DBEAFE", "FCE7F3"]
+    zonas_poly = [(z, _poligono_zona(z)) for z in zonas]
+    per = normalizar_poligono(perimetro)
+    for ix in range(nx):
+        x = (ix + .5) * escala
+        for gy in range(ny):
+            y = (gy + .5) * escala
+            cell = ws.cell(fila_inicio + ny - 1 - gy, 2 + ix)
+            cell.fill = PatternFill("solid", fgColor="E5E7EB")
+            zona_idx = next((i for i, (_, poly) in enumerate(zonas_poly)
+                             if poly and punto_en_poligono(x, y, poly)), None)
+            if (zona_idx is not None
+                    and (not per or punto_en_poligono(x, y, per))):
+                cell.fill = PatternFill(
+                    "solid", fgColor=zona_colores[zona_idx % len(zona_colores)])
+    for elementos, color in ((obstaculos or [], "EF4444"),
+                              (accesos or [], "F97316")):
+        fill = PatternFill("solid", fgColor=color)
+        for item in elementos:
+            if not all(item.get(k) is not None for k in ("x", "y", "w", "d")):
+                continue
+            x0, x1 = float(item["x"]), float(item["x"]) + float(item["w"])
+            y0, y1 = float(item["y"]), float(item["y"]) + float(item["d"])
+            for ix in range(max(0, int(x0 // escala)),
+                            min(nx, int(math.ceil(x1 / escala)))):
+                for gy in range(max(0, int(y0 // escala)),
+                                min(ny, int(math.ceil(y1 / escala)))):
+                    ws.cell(fila_inicio + ny - 1 - gy, 2 + ix).fill = fill
+
+    ids_error = {str(i.get("elemento")) for i in (validacion or {}).get("issues", [])
+                 if i.get("nivel") == "ERROR"}
+    codigos = [str(t.get("codigo") or "") for t in tipos]
+    colores_tipo = ["22C55E", "3B82F6", "8B5CF6", "EAB308", "EC4899", "06B6D4"]
+    color_por_tipo = {codigo: colores_tipo[i % len(colores_tipo)]
+                      for i, codigo in enumerate(codigos)}
+    for s in completas:
+        x0, x1 = float(s["x"]), float(s["x"]) + float(s["w"])
+        y0, y1 = float(s["y"]), float(s["y"]) + float(s["d"])
+        cells = []
+        fill = PatternFill(
+            "solid", fgColor=("FCA5A5" if str(s.get("id")) in ids_error
+                               else color_por_tipo.get(str(s.get("tipo_codigo")), "10B981")))
+        for ix in range(max(0, int(x0 // escala)),
+                        min(nx, int(math.ceil(x1 / escala)))):
+            for gy in range(max(0, int(y0 // escala)),
+                            min(ny, int(math.ceil(y1 / escala)))):
+                cell = ws.cell(fila_inicio + ny - 1 - gy, 2 + ix)
+                cell.fill = fill
+                cells.append(cell)
+        if cells:
+            etiqueta = str(s.get("codigo_wms") or s.get("sku_asignado")
+                           or s.get("id") or "")
+            cells[0].value = etiqueta[:18]
+            cells[0].font = Font(size=7, bold=True, color=BLANCO)
+
+    leyenda = fila_inicio + ny + 2
+    ws.cell(leyenda, 1, "Leyenda").font = Font(bold=True, color=AZUL)
+    for i, z in enumerate(zonas):
+        ws.cell(leyenda + i, 2).fill = PatternFill(
+            "solid", fgColor=zona_colores[i % len(zona_colores)])
+        ws.cell(leyenda + i, 3, str(z.get("nombre") or f"Zona {i + 1}"))
+    base = leyenda + len(zonas)
+    for i, codigo in enumerate(codigos):
+        ws.cell(base + i, 2).fill = PatternFill(
+            "solid", fgColor=color_por_tipo[codigo])
+        ws.cell(base + i, 3, codigo)
+    ws.freeze_panes = "B4"
+    ws.protection.sheet = True
+    ws.protection.enable()
+
+
 def exportar_excel(slots: list[dict], zonas: list[dict], tipos: list[dict], df,
                    ancho_m: float, largo_m: float, escala_m: float = 0.5,
                    validacion: dict | None = None, perimetro=None,
@@ -589,8 +707,12 @@ def exportar_excel(slots: list[dict], zonas: list[dict], tipos: list[dict], df,
                                  for k in ("x", "y", "w", "d"))
                          for s in slots)
     _crear_validacion(wb, validacion, pendientes_geo)
-    mapa = _crear_mapa(wb, slots, zonas, tipos, ancho_m, largo_m, escala_m,
-                       relacion_fin, validacion, perimetro, obstaculos, accesos)
+    mapa = _crear_mapa_preliminar(
+        wb, slots, zonas, tipos, ancho_m, largo_m, escala_m, relacion_fin,
+        validacion, perimetro, obstaculos, accesos)
+    _crear_mapa_restringido(
+        wb, slots, zonas, tipos, ancho_m, largo_m, escala_m, validacion,
+        perimetro, obstaculos, accesos)
     _crear_listas_y_validaciones(wb, df, tipos, zonas)
     _crear_dashboard(wb, sku_fin, mapa)
     for nombre in ("Instrucciones", "Zonas", "Localidades",
@@ -610,14 +732,14 @@ def _headers(ws) -> dict[str, int]:
     return {str(c.value).strip(): i for i, c in enumerate(ws[1]) if c.value}
 
 
-def _importar_mapa_colocacion(wb, pool: list[dict], zonas: list[dict]
+def _importar_mapa_preliminar(wb, pool: list[dict], zonas: list[dict]
                               ) -> tuple[list[dict], list[str], list[str]]:
     """Convierte las anclas tipo / tipo|V del mapa en localidades métricas."""
-    ws = wb["Mapa_colocacion"]
+    ws = wb["Mapa_preliminar"]
     fila_coord = next((r for r in range(1, min(ws.max_row, 1000) + 1)
                        if str(ws.cell(r, 1).value or "").strip() == "Y \\ X"), None)
     if not fila_coord:
-        return [], ["Mapa_colocacion: no se encontró el origen de la rejilla."], []
+        return [], ["Mapa_preliminar: no se encontró el origen de la rejilla."], []
     xs = []
     col = 2
     while col <= ws.max_column and isinstance(ws.cell(fila_coord, col).value,
@@ -630,7 +752,7 @@ def _importar_mapa_colocacion(wb, pool: list[dict], zonas: list[dict]
         ys.append((row, float(ws.cell(row, 1).value)))
         row += 1
     if not xs or not ys:
-        return [], ["Mapa_colocacion: la rejilla no tiene coordenadas válidas."], []
+        return [], ["Mapa_preliminar: la rejilla no tiene coordenadas válidas."], []
 
     tipos = {}
     if "Tipos_ubicacion" in wb.sheetnames:
@@ -668,14 +790,14 @@ def _importar_mapa_colocacion(wb, pool: list[dict], zonas: list[dict]
             tipo = tipos.get(codigo)
             if not tipo:
                 errores.append(
-                    f"Mapa_colocacion {ws.cell(row, col).coordinate}: "
+                    f"Mapa_preliminar {ws.cell(row, col).coordinate}: "
                     f"tipo desconocido '{texto}'.")
                 continue
             indice = usados_tipo.get(codigo, 0)
             candidatos = por_tipo.get(codigo, [])
             if indice >= len(candidatos):
                 errores.append(
-                    f"Mapa_colocacion: colocaste más localidades '{codigo}' "
+                    f"Mapa_preliminar: colocaste más localidades '{codigo}' "
                     "de las requeridas.")
                 continue
             usados_tipo[codigo] = indice + 1
@@ -826,9 +948,9 @@ def importar_excel(datos: bytes) -> dict:
                                     ("abc", "abc")):
                 z[destino] = [p.strip() for p in str(get(origen) or "").replace(";", ",").split(",") if p.strip()]
             zonas.append(z)
-    modo_mapa = "Mapa_colocacion" in wb.sheetnames
+    modo_mapa = "Mapa_preliminar" in wb.sheetnames
     if modo_mapa:
-        slots_mapa, errores_mapa, pendientes_mapa = _importar_mapa_colocacion(
+        slots_mapa, errores_mapa, pendientes_mapa = _importar_mapa_preliminar(
             wb, pool, zonas)
         slots = slots_mapa
         pendientes = pendientes_mapa
