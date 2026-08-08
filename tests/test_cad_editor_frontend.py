@@ -25,9 +25,12 @@ class TestEditorLocalidades(unittest.TestCase):
 
     def test_editor_expone_paleta_corridas_y_validacion(self):
         for marker in (
-            "Tipos de localidad", "Trazar corrida", "Guardar layout",
+            "Tipos de localidad", "Llenar zona", "4 líneas + 2 pasillos",
+            "function planCorrida", "Guardar layout",
+            "function ajustarRectaImanes", "Imán ${locSnapEnabled",
+            "Alt desactiva temporalmente", "Inicio ${meta.axis0",
             "function validarLocalidades()", "localidades_planificadas",
-            "presupuesto:next.presupuesto",
+            "presupuesto:next.presupuesto", "configuracion_localidades",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.html)

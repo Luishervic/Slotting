@@ -495,7 +495,8 @@ def _reserva_admite(reserva, valor) -> bool:
 def distribuir(df_skus: pd.DataFrame, slots: list[dict],
                cfg: SlotConfig | None = None,
                forzados: dict | None = None,
-               max_ubic: dict | None = None) -> dict:
+               max_ubic: dict | None = None,
+               zona_especial: str | None = None) -> dict:
     """Asigna SKUs a ubicaciones dedicadas. Devuelve asignaciones, posiciones,
     estado de ubicaciones y KPIs.
 
@@ -506,10 +507,15 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
     max_ubic: dict {sku: n} — tope de UBICACIONES para ese SKU (control de
     sobre-stock): conserva hasta n ubicaciones y sus unidades restantes se
     reportan en `excedentes` (NO en overflow), para acomodarlas en otra zona.
+
+    zona_especial: si se declara, el tope aplica sólo a las ubicaciones
+    regulares. Los SKU que lo alcanzan pueden continuar en esa zona; los demás
+    no consumen accidentalmente su capacidad.
     """
     cfg = cfg or SlotConfig()
     forzados = {str(u): str(s) for u, s in (forzados or {}).items() if s}
     max_ubic = {str(k): int(v) for k, v in (max_ubic or {}).items()}
+    zona_especial = str(zona_especial or "")
     d = df_skus[df_skus.get("unidades", 0).fillna(0) > 0].copy()
     d = _orden_skus(d, cfg)
 
@@ -523,7 +529,10 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
         s["multisku"] = bool(s.get("multisku"))
         s["_x_usado"], s["_skus"], s["_cerrado"] = 0.0, [], False
         s["_familia_base"], s["_clase_base"] = "", ""
+    es_especial = lambda s: bool(zona_especial and str(
+        s.get("zona_layout") or "") == zona_especial)
     slots_ord = sorted(slots, key=lambda s: (
+        es_especial(s),
         s["prioridad"] if s.get("prioridad") is not None else 1e9,
         s["y"], s["x"]))
     candidatos_por_clase: dict[str, list[dict]] = {}
@@ -540,7 +549,8 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
     remaining = {str(r["sku"]): int(r["unidades"]) for r in filas_sku}
 
     asignaciones, posiciones, no_factibles = [], [], []
-    usadas: dict = {}   # nº de ubicaciones ya usadas por SKU (para max_ubic)
+    usadas: dict = {}   # nº total de ubicaciones usadas por SKU
+    usadas_regulares: dict = {}  # sólo las sujetas al tope de sobre-stock
 
     # ---- Pase 0: asignaciones forzadas (prioridad, ignoran restricciones). --
     for slot_id, sku_id in forzados.items():
@@ -565,6 +575,8 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
                           f"({slot['w']:.1f}×{slot['d']:.1f} m)"}); continue
         _asignar(slot, sku, cap, place, cfg, posiciones, asignaciones, True)
         usadas[sku_id] = usadas.get(sku_id, 0) + 1
+        if not es_especial(slot):
+            usadas_regulares[sku_id] = usadas_regulares.get(sku_id, 0) + 1
         remaining[sku_id] -= place
 
     # ---- Pase 1: autodistribución. Multi-SKU: acepta cualquier SKU y se va
@@ -599,8 +611,13 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
         for slot in candidatos[i0:]:
             if rem <= 0:
                 break
-            if cap_u is not None and usadas.get(sid, 0) >= cap_u:
-                break   # tope de sobre-stock: el resto va a `excedentes`
+            slot_especial = es_especial(slot)
+            if slot_especial:
+                if cap_u is None or usadas_regulares.get(sid, 0) < cap_u:
+                    continue  # la reserva especial sólo recibe excedentes
+            elif (cap_u is not None
+                  and usadas_regulares.get(sid, 0) >= cap_u):
+                continue
             if slot["_cerrado"]:
                 continue
             if (slot["multisku"] and cfg.multisku_max_skus
@@ -645,6 +662,8 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
             place = min(rem, cap["units"])
             _asignar(slot, sku, cap, place, cfg, posiciones, asignaciones, False)
             usadas[sid] = usadas.get(sid, 0) + 1
+            if not slot_especial:
+                usadas_regulares[sid] = usadas_regulares.get(sid, 0) + 1
             rem -= place
         remaining[sid] = rem
 
@@ -654,7 +673,7 @@ def distribuir(df_skus: pd.DataFrame, slots: list[dict],
     for s, rem in remaining.items():
         if rem <= 0:
             continue
-        if s in max_ubic and usadas.get(s, 0) >= max_ubic[s]:
+        if s in max_ubic and usadas_regulares.get(s, 0) >= max_ubic[s]:
             excedentes.append({
                 "sku": s, "familia": sku_rows[s].get("familia"),
                 "seccion_general_descripcion": sku_rows[s].get(

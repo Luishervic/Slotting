@@ -76,6 +76,8 @@ def _cargar_demanda(codigo: str, ventana: int | None):
 
 
 def _layout_vivo():
+    if st.session_state.get("rack_validated_result") is not None:
+        return st.session_state["rack_validated_result"]
     if st.session_state.get("slots"):
         cfg_sf = st.session_state.get("cfg_slotfirst") or S.SlotConfig(
             largo_m=st.session_state.get("largo_m", 56.0),

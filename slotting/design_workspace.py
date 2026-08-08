@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
@@ -20,7 +21,7 @@ from slotting.ui import navegacion, titulo_pagina
 
 
 ETAPAS = ["1 · Análisis de mercancía", "2 · Restricciones por zona",
-          "3 · Preparar localidades"]
+          "3 · Distribuir localidades"]
 
 
 def _motor():
@@ -33,6 +34,13 @@ def _inicializar() -> None:
         "perimetro": [], "obstaculos": [], "accesos": [],
         "zonas_layout": [], "slots": [], "tipos_catalogo": [],
         "diseno_workspace": ETAPAS[0], "slots_rev": 0,
+        "min_unidades_localidad_dedicada": 2,
+        "max_localidades_regulares_sku": 4,
+        "zona_especial_localidades": "",
+        "separacion_localidades_m": 0.03,
+        "tolerancia_iman_m": 0.15,
+        "mostrar_guias_editor": True,
+        "imantar_centros_editor": True,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -193,7 +201,8 @@ def _aplicar_editor(valor: dict | None) -> None:
 def _editor(df: pd.DataFrame, key: str, *, incluir_tipos: bool = True,
             modo_localidades: bool = False,
             localidades_planificadas: list[dict] | None = None,
-            presupuesto: list[dict] | None = None) -> None:
+            presupuesto: list[dict] | None = None,
+            configuracion_localidades: dict | None = None) -> None:
     valor = editor_cad(
         st.session_state["perimetro"], st.session_state["obstaculos"],
         st.session_state["accesos"], st.session_state["zonas_layout"],
@@ -203,7 +212,9 @@ def _editor(df: pd.DataFrame, key: str, *, incluir_tipos: bool = True,
                if incluir_tipos else []),
         catalogos=_catalogos(df),
         localidades_planificadas=localidades_planificadas,
-        presupuesto=presupuesto, modo_localidades=modo_localidades, key=key)
+        presupuesto=presupuesto,
+        configuracion_localidades=configuracion_localidades,
+        modo_localidades=modo_localidades, key=key)
     _aplicar_editor(valor)
 
 
@@ -404,20 +415,112 @@ def _configuracion_layout():
         largo_m=float(st.session_state["largo_m"]),
         perimetro=normalizar_poligono(st.session_state["perimetro"]),
         zonas=[dict(z) for z in st.session_state["zonas_layout"]],
-        codigo_zona=st.session_state.get("cedis_codigo", "UB"))
+        codigo_zona=st.session_state.get("cedis_codigo", "UB"),
+        multisku_regla_abc=False)
 
 
-def _plan_restricciones(df: pd.DataFrame) -> dict:
+def _max_ubicaciones_por_sku(requerimientos: list[dict],
+                             max_regulares: int) -> dict[str, int]:
+    """Topes que separan capacidad regular y excedente deliberado."""
+    limite = max(1, int(max_regulares))
+    return {
+        str(r["sku"]): limite
+        for r in requerimientos
+        if int(r.get("localidades_necesarias") or 0) > limite
+    }
+
+
+def _mercancia_excedente(df: pd.DataFrame,
+                         requerimientos: list[dict]) -> pd.DataFrame:
+    """Catálogo con sólo las unidades que deben ir a la zona especial."""
+    excedente = {
+        str(r["sku"]): int(r.get("unidades_zona_especial") or 0)
+        for r in requerimientos
+        if int(r.get("unidades_zona_especial") or 0) > 0
+    }
+    if not excedente:
+        return df.iloc[0:0].copy()
+    salida = df[df["sku"].astype(str).isin(excedente)].copy()
+    salida = salida.drop_duplicates("sku", keep="last")
+    salida["unidades"] = salida["sku"].astype(str).map(excedente).astype(int)
+    return salida
+
+
+def _combinar_planes(regular: dict, especial: dict | None) -> dict:
+    """Une presupuestos sin perder el destino de cada localidad."""
+    partes_resumen = []
+    for plan, destino in ((regular, "REGULAR"),
+                          (especial, "ZONA_ESPECIAL")):
+        if not plan:
+            continue
+        tabla = plan.get("resumen", pd.DataFrame())
+        if isinstance(tabla, pd.DataFrame) and not tabla.empty:
+            tabla = tabla.copy()
+            tabla["destino"] = destino
+            partes_resumen.append(tabla)
+    partes_zona = [p["por_zona"] for p in (regular, especial)
+                   if p and isinstance(p.get("por_zona"), pd.DataFrame)
+                   and not p["por_zona"].empty]
+    return {
+        "por_zona": (pd.concat(partes_zona, ignore_index=True)
+                     if partes_zona else pd.DataFrame()),
+        "resumen": (pd.concat(partes_resumen, ignore_index=True)
+                    if partes_resumen else pd.DataFrame()),
+        "ubicaciones_requeridas": int(
+            regular.get("ubicaciones_requeridas", 0)
+            + (especial or {}).get("ubicaciones_requeridas", 0)),
+        "m2_ubicaciones": round(float(
+            regular.get("m2_ubicaciones", 0)
+            + (especial or {}).get("m2_ubicaciones", 0)), 2),
+        "skus_sin_zona": int(regular.get("skus_sin_zona", 0)
+                             + (especial or {}).get("skus_sin_zona", 0)),
+        "regular": regular,
+        "especial": especial,
+    }
+
+
+def _plan_restricciones(df: pd.DataFrame,
+                        requerimientos: list[dict] | None = None) -> dict:
     S = _motor()
     viable = S.filtrar_dimensiones_validas(df[df["unidades"].gt(0)])
-    return S.calcular_necesidad_por_zonas(
-        viable, _configuracion_layout(),
+    requerimientos = requerimientos or _requerimientos_sku(df)
+    minimo = max(1, int(st.session_state.get(
+        "min_unidades_localidad_dedicada", 2)))
+    max_regulares = max(1, int(st.session_state.get(
+        "max_localidades_regulares_sku", 4)))
+    zona_especial = str(st.session_state.get(
+        "zona_especial_localidades", "") or "")
+    cfg = replace(_configuracion_layout(), multisku_regla_abc=False)
+    zonas_regulares = [dict(z) for z in cfg.zonas
+                       if str(z.get("nombre") or "") != zona_especial]
+    if not zonas_regulares:
+        zonas_regulares = [dict(z) for z in cfg.zonas]
+    cfg_regular = replace(cfg, zonas=zonas_regulares)
+    reglas = _reglas_zona(st.session_state["zonas_layout"],
+                          st.session_state["tipos_catalogo"])
+    plan_regular = S.calcular_necesidad_por_zonas(
+        viable, cfg_regular,
         tipos=st.session_state["tipos_catalogo"],
-        reglas=_reglas_zona(st.session_state["zonas_layout"],
-                            st.session_state["tipos_catalogo"]))
+        umbral_multisku=max(0, minimo - 1),
+        max_ubic=_max_ubicaciones_por_sku(requerimientos, max_regulares),
+        reglas={k: v for k, v in reglas.items() if k != zona_especial})
+    plan_especial = None
+    mercancia_especial = _mercancia_excedente(viable, requerimientos)
+    zona = next((dict(z) for z in cfg.zonas
+                 if str(z.get("nombre") or "") == zona_especial), None)
+    if zona and not mercancia_especial.empty:
+        cfg_especial = replace(cfg, zonas=[zona])
+        plan_especial = S.calcular_necesidad_por_zonas(
+            mercancia_especial, cfg_especial,
+            tipos=st.session_state["tipos_catalogo"],
+            umbral_multisku=0, reglas={zona_especial: reglas.get(
+                zona_especial, {})})
+    return _combinar_planes(plan_regular, plan_especial)
 
 
-def _requerimientos_sku(df: pd.DataFrame) -> list[dict]:
+def _requerimientos_sku(df: pd.DataFrame,
+                        min_unidades_dedicada: int | None = None,
+                        max_localidades_regulares: int | None = None) -> list[dict]:
     S = _motor()
     tipos = {str(t.get("codigo")): dict(t)
              for t in st.session_state.get("tipos_catalogo", [])}
@@ -428,6 +531,13 @@ def _requerimientos_sku(df: pd.DataFrame) -> list[dict]:
                     if isinstance(asignaciones, pd.DataFrame)
                     and not asignaciones.empty else {})
     cfg = _configuracion_layout()
+    minimo = max(1, int(min_unidades_dedicada if min_unidades_dedicada
+                        is not None else st.session_state.get(
+                            "min_unidades_localidad_dedicada", 2)))
+    max_regulares = max(1, int(max_localidades_regulares
+                              if max_localidades_regulares is not None
+                              else st.session_state.get(
+                                  "max_localidades_regulares_sku", 4)))
     filas = []
     activos = df[pd.to_numeric(df["unidades"], errors="coerce").fillna(0).gt(0)]
     for _, r in activos.drop_duplicates("sku", keep="last").iterrows():
@@ -450,6 +560,8 @@ def _requerimientos_sku(df: pd.DataFrame) -> list[dict]:
         descripcion = next((str(r.get(c)) for c in
                             ("descripcion", "descripcion_articulo", "DESCRIPCION")
                             if c in r and pd.notna(r.get(c))), "")
+        necesarias = max(1, int((unidades + cap - 1) // cap))
+        unidades_especial = max(0, unidades - max_regulares * cap)
         filas.append({
             "sku": sku, "descripcion": descripcion, "unidades": unidades,
             "abc": r.get("clase_abc", ""),
@@ -458,7 +570,12 @@ def _requerimientos_sku(df: pd.DataFrame) -> list[dict]:
             "familia": r.get("familia", ""),
             "zona_fisica": r.get("zona_fisica", ""),
             "tipo_codigo": codigo, "capacidad_localidad": cap,
-            "localidades_necesarias": max(1, int((unidades + cap - 1) // cap)),
+            "localidades_necesarias": necesarias,
+            "modalidad": ("COMPARTIDA" if unidades < minimo
+                           else "DEDICADA"),
+            "localidades_regulares": min(necesarias, max_regulares),
+            "localidades_zona_especial": max(0, necesarias - max_regulares),
+            "unidades_zona_especial": unidades_especial,
         })
     return filas
 
@@ -473,27 +590,36 @@ def _localidades_planificadas(plan: dict) -> list[dict]:
     if not isinstance(resumen, pd.DataFrame) or resumen.empty:
         return slots
     for r in resumen.itertuples():
-        cantidad = int(getattr(r, "ubicaciones", 0) or 0)
         tipo = tipos.get(str(getattr(r, "tipo_codigo", "")), {})
         zona = str(getattr(r, "zona", ""))
         regla = reglas.get(zona, {})
-        for _ in range(cantidad):
-            numero += 1
-            slots.append({
-                "id": f"LOC-{numero:04d}", "codigo_wms": None,
-                "tipo_codigo": str(getattr(r, "tipo_codigo", "")),
-                "zona_layout": zona, "x": None, "y": None,
-                "w": float(getattr(r, "w", tipo.get("w", 0))),
-                "d": float(getattr(r, "d", tipo.get("d", 0))),
-                "altura_util_nivel_m": getattr(r, "h", tipo.get("h")),
-                "clase_abc_reservada": regla.get("abc") or None,
-                "departamento_reservado": regla.get("departamentos") or None,
-                "clase_comercial_reservada": regla.get("clases") or None,
-                "familia_reservada": regla.get("familias") or None,
-                "zona_fisica_reservada": regla.get("zonas_fisicas") or None,
-                "multisku": bool(regla.get("solo_multi", False)),
-                "activa": True,
-            })
+        destino = str(getattr(r, "destino", "REGULAR") or "REGULAR")
+        cantidades = (
+            (False, int(getattr(r, "ubic_mono", 0) or 0)),
+            (True, int(getattr(r, "ubic_multi", 0) or 0)),
+        )
+        if not sum(c for _, c in cantidades):
+            cantidades = ((bool(regla.get("solo_multi", False)),
+                           int(getattr(r, "ubicaciones", 0) or 0)),)
+        for multisku, cantidad in cantidades:
+            for _ in range(cantidad):
+                numero += 1
+                slots.append({
+                    "id": f"LOC-{numero:04d}", "codigo_wms": None,
+                    "tipo_codigo": str(getattr(r, "tipo_codigo", "")),
+                    "zona_layout": zona, "destino": destino,
+                    "x": None, "y": None,
+                    "w": float(getattr(r, "w", tipo.get("w", 0))),
+                    "d": float(getattr(r, "d", tipo.get("d", 0))),
+                    "altura_util_nivel_m": getattr(r, "h", tipo.get("h")),
+                    "clase_abc_reservada": regla.get("abc") or None,
+                    "departamento_reservado": regla.get("departamentos") or None,
+                    "clase_comercial_reservada": regla.get("clases") or None,
+                    "familia_reservada": regla.get("familias") or None,
+                    "zona_fisica_reservada": regla.get("zonas_fisicas") or None,
+                    "multisku": bool(multisku or regla.get("solo_multi", False)),
+                    "activa": True,
+                })
     return slots
 
 
@@ -501,6 +627,11 @@ def _presupuesto_editor(localidades: list[dict],
                         tipos: list[dict]) -> list[dict]:
     """Resume el objetivo físico que consume la paleta del editor CAD."""
     requeridas = Counter(str(s.get("tipo_codigo") or "") for s in localidades)
+    por_zona = Counter((str(s.get("tipo_codigo") or ""),
+                        str(s.get("zona_layout") or ""))
+                       for s in localidades)
+    especiales = Counter(str(s.get("tipo_codigo") or "") for s in localidades
+                          if s.get("destino") == "ZONA_ESPECIAL")
     salida = []
     for tipo in tipos:
         codigo = str(tipo.get("codigo") or "")
@@ -515,6 +646,12 @@ def _presupuesto_editor(localidades: list[dict],
             "zona_fisica": str(tipo.get("zona_fisica") or ""),
             "estructura": str(tipo.get("tipo_estructura") or "PISO"),
             "requeridas": int(requeridas.get(codigo, 0)),
+            "especiales": int(especiales.get(codigo, 0)),
+            "por_zona": [
+                {"zona": zona, "requeridas": int(cantidad)}
+                for (tipo_codigo, zona), cantidad in sorted(por_zona.items())
+                if tipo_codigo == codigo
+            ],
         })
     return salida
 
@@ -612,12 +749,79 @@ def _mostrar_validacion(reporte: dict, *, detalle: bool = True) -> None:
                      width="stretch")
 
 
+def _configurar_politica_localidades(df: pd.DataFrame) -> list[dict]:
+    """Una sola banda de decisiones antes de dibujar capacidad física."""
+    st.markdown("#### Política de asignación")
+    st.caption(
+        "Estas reglas cambian cuántas localidades se preparan; no cambian las "
+        "dimensiones X/Y/Z de los tipos ya aprobados.")
+    nombres = [str(z.get("nombre") or f"Zona {i + 1}")
+               for i, z in enumerate(st.session_state["zonas_layout"])]
+    opciones = [""] + nombres
+    if st.session_state.get("zona_especial_localidades", "") not in opciones:
+        st.session_state["zona_especial_localidades"] = ""
+    c1, c2, c3, c4 = st.columns(4)
+    c1.number_input(
+        "Localidad dedicada desde", min_value=1, max_value=999,
+        step=1, key="min_unidades_localidad_dedicada",
+        help="Los SKU con menos unidades comparten una localidad multi-SKU compatible.")
+    c2.number_input(
+        "Máximo regular por SKU", min_value=1, max_value=999,
+        step=1, key="max_localidades_regulares_sku",
+        help="Las unidades que excedan este número de localidades se presupuestan en la zona especial.")
+    c3.selectbox(
+        "Zona especial de excedentes", opciones, key="zona_especial_localidades",
+        format_func=lambda x: x or "Sin definir")
+    c4.number_input(
+        "Separación mínima (m)", min_value=0.0, max_value=5.0,
+        step=0.01, format="%.2f", key="separacion_localidades_m",
+        help="Holgura física entre localidades creadas por una corrida.")
+    with st.expander("Ayudas de precisión del editor", expanded=False):
+        p1, p2, p3 = st.columns(3)
+        p1.number_input(
+            "Tolerancia del imán (m)", min_value=0.0, max_value=2.0,
+            step=0.01, format="%.2f", key="tolerancia_iman_m",
+            help="Distancia máxima para atraer un borde o centro hacia una guía.")
+        p2.checkbox("Mostrar guías y cotas", key="mostrar_guias_editor")
+        p3.checkbox("Imantar también a centros", key="imantar_centros_editor")
+        st.caption(
+            "El imán prioriza rejilla, bordes de zona, localidades y obstáculos. "
+            "Mantén Alt mientras colocas o mueves para desactivarlo temporalmente.")
+    requerimientos = _requerimientos_sku(df)
+    compartidos = sum(r["modalidad"] == "COMPARTIDA" for r in requerimientos)
+    excedidos = sum(int(r["unidades_zona_especial"]) > 0
+                    for r in requerimientos)
+    unidades_especiales = sum(int(r["unidades_zona_especial"])
+                              for r in requerimientos)
+    st.caption(
+        f"Resultado de la política: **{compartidos:,} SKU** compartirán "
+        f"localidad · **{excedidos:,} SKU / {unidades_especiales:,} unidades** "
+        "irán a la zona especial.")
+    if excedidos and not st.session_state.get("zona_especial_localidades"):
+        st.warning(
+            "Hay excedentes, pero falta seleccionar una zona especial. El "
+            "presupuesto regular se limitará y el excedente quedará pendiente.")
+    elif (excedidos and st.session_state.get("zona_especial_localidades")
+          and len(nombres) < 2):
+        st.warning(
+            "La zona especial debe ser un área física distinta de la regular. "
+            "Dibuja una segunda zona antes de liberar el layout.")
+    with st.expander("Criterios que conviene cerrar antes del layout", expanded=False):
+        st.markdown(
+            "- **Holgura perimetral por zona:** mantenimiento, muros y tolerancia de instalación.\n"
+            "- **Ancho y sentido de pasillos:** validar seguridad, radios de giro y circulación de equipos.\n"
+            "- **Compatibilidad de la zona especial:** debe admitir físicamente todos los tipos que recibirá.\n"
+            "- **Reserva de crecimiento:** dejar capacidad sin ocupar para altas, estacionalidad y re-slotting.\n"
+            "- **Regla WMS:** cerrar nomenclatura, nivel, posición y política multi-SKU antes de liberar el plano.")
+    return requerimientos
+
+
 def _vista_localidades(df: pd.DataFrame) -> None:
     st.subheader("Preparar localidades y relacionarlas con los SKU")
     st.caption(
-        "El sistema calcula cuánto se necesita. Distribuyes los tipos en el "
-        "mapa preliminar; al reimportar se asignan los SKU compatibles y se "
-        "genera el mapa restringido con su tamaño físico real.")
+        "El sistema calcula cuánto se necesita. Tú defines la política por "
+        "SKU y distribuyes los tipos directamente sobre sus zonas; el motor "
+        "asigna después la mercancía compatible.")
     if not st.session_state.get("tipos_catalogo"):
         st.warning("Primero analiza la mercancía y aprueba los tipos de localidad.")
         return
@@ -626,9 +830,9 @@ def _vista_localidades(df: pd.DataFrame) -> None:
         if st.button("Volver a restricciones"):
             _pasar(ETAPAS[1])
         return
+    requerimientos = _configurar_politica_localidades(df)
     try:
-        plan = _plan_restricciones(df)
-        requerimientos = _requerimientos_sku(df)
+        plan = _plan_restricciones(df, requerimientos)
     except Exception as exc:
         st.error(str(exc))
         return
@@ -666,7 +870,19 @@ def _vista_localidades(df: pd.DataFrame) -> None:
     _editor(
         df, f"cad_localidades_{st.session_state.get('slots_rev', 0)}",
         modo_localidades=True, localidades_planificadas=plantilla,
-        presupuesto=presupuesto)
+        presupuesto=presupuesto,
+        configuracion_localidades={
+            "separacion_m": float(st.session_state[
+                "separacion_localidades_m"]),
+            "zona_especial": st.session_state.get(
+                "zona_especial_localidades", ""),
+            "tolerancia_iman_m": float(st.session_state[
+                "tolerancia_iman_m"]),
+            "mostrar_guias": bool(st.session_state[
+                "mostrar_guias_editor"]),
+            "imantar_centros": bool(st.session_state[
+                "imantar_centros_editor"]),
+        })
     actuales = [s for s in st.session_state.get("slots", [])
                 if s.get("activa", True)]
     validacion = _validacion_actual(actuales)
@@ -721,7 +937,12 @@ def _vista_localidades(df: pd.DataFrame) -> None:
             else:
                 resultado_auto = _motor().distribuir(
                     df[df["unidades"].gt(0)], importado["slots"],
-                    _configuracion_layout())
+                    _configuracion_layout(),
+                    max_ubic=_max_ubicaciones_por_sku(
+                        requerimientos, st.session_state[
+                            "max_localidades_regulares_sku"]),
+                    zona_especial=st.session_state.get(
+                        "zona_especial_localidades") or None)
                 slots_asignados = resultado_auto.get("modulos") or importado["slots"]
                 asignaciones = resultado_auto.get("asignaciones", pd.DataFrame())
                 relaciones_auto = []
@@ -775,7 +996,13 @@ def _vista_localidades(df: pd.DataFrame) -> None:
     S = _motor()
     cfg = _configuracion_layout()
     if actuales and validacion["valido"]:
-        res = S.distribuir(df[df["unidades"].gt(0)], actuales, cfg)
+        res = S.distribuir(
+            df[df["unidades"].gt(0)], actuales, cfg,
+            max_ubic=_max_ubicaciones_por_sku(
+                requerimientos,
+                st.session_state["max_localidades_regulares_sku"]),
+            zona_especial=st.session_state.get(
+                "zona_especial_localidades") or None)
         res["obstaculos"] = st.session_state["obstaculos"]
         st.session_state["res_slotfirst"] = res
         st.session_state["cfg_slotfirst"] = cfg
@@ -793,6 +1020,25 @@ def _vista_localidades(df: pd.DataFrame) -> None:
             st.switch_page("pages/3_Operacion.py")
         except AttributeError:
             st.info("Abre ‘3. Evaluar y decidir’ en el menú lateral.")
+
+
+def _vista_enlace_distribucion(df: pd.DataFrame) -> None:
+    st.subheader("Distribuir localidades en un espacio de trabajo dedicado")
+    st.caption(
+        "La configuración física se abre en una página amplia para que la "
+        "paleta, el plano y el inspector no compitan con las otras etapas.")
+    tipos = len(st.session_state.get("tipos_catalogo", []))
+    zonas = len(st.session_state.get("zonas_layout", []))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Tipos aprobados", tipos)
+    c2.metric("Zonas configuradas", zonas)
+    c3.metric("Localidades guardadas", len(st.session_state.get("slots", [])))
+    bloqueado = not tipos or not zonas
+    if bloqueado:
+        st.warning("Completa el análisis de mercancía y las restricciones por zona.")
+    if st.button("Abrir distribución de localidades", type="primary",
+                 disabled=bloqueado, width="stretch"):
+        st.switch_page("pages/2_Distribucion.py")
 
 
 def render() -> None:
@@ -814,7 +1060,29 @@ def render() -> None:
     elif etapa == ETAPAS[1]:
         _vista_plano(df)
     else:
-        _vista_localidades(df)
+        _vista_enlace_distribucion(df)
 
 
-__all__ = ["render"]
+def render_distribucion() -> None:
+    st.set_page_config(page_title="Distribuir localidades", page_icon="📐",
+                       layout="wide")
+    navegacion("distribucion")
+    titulo_pagina(
+        "Diseño físico",
+        "Distribuir localidades",
+        "Define la política por SKU y llena cada zona con patrones físicos sin traslapes.")
+    if "df" not in st.session_state:
+        st.warning("Primero carga y confirma los datos de mercancía.")
+        st.stop()
+    _inicializar()
+    df, columna, factor = _escenario(st.session_state["df"])
+    st.caption(
+        f"Escenario: **{st.session_state.get('escenario_nombre', 'Existencia actual')}** "
+        f"· {columna} × {factor:.2f}")
+    if st.button("← Volver a restricciones y tipos"):
+        st.session_state["diseno_workspace"] = ETAPAS[1]
+        st.switch_page("pages/2_Diseno.py")
+    _vista_localidades(df)
+
+
+__all__ = ["render", "render_distribucion"]

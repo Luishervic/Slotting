@@ -121,6 +121,31 @@ class TestGeneracionPorZonas(BaseZonas):
                           and b["y"] < a["y"] + a["d"] - 1e-6)
                 self.assertFalse(solapa, f"{a['id']} encima de {b['id']}")
 
+    def test_tope_regular_continua_solo_en_zona_especial(self):
+        df = pd.DataFrame({
+            "sku": ["X"], "familia": ["F"], "clase_comercial": ["C"],
+            "zona_fisica": ["PISO"], "clase_abc": ["A"],
+            "unidades": [5], "largo_cm": [60], "ancho_cm": [50],
+            "alto_cm": [70], "peso_kg": [10], "max_estiba": [1],
+        })
+        slots = [
+            {"id": f"R{i}", "x": i, "y": 0, "w": .65, "d": .55,
+             "altura_util_nivel_m": .75, "zona_layout": "Regular"}
+            for i in range(4)
+        ] + [
+            {"id": f"E{i}", "x": i, "y": 2, "w": .65, "d": .55,
+             "altura_util_nivel_m": .75, "zona_layout": "Especial"}
+            for i in range(3)
+        ]
+        out = S.distribuir(
+            df, slots, S.SlotConfig(ancho_m=10, largo_m=10),
+            max_ubic={"X": 2}, zona_especial="Especial")
+        ids = out["asignaciones"]["ubicacion"].astype(str).tolist()
+        self.assertEqual(sum(i.startswith("R") for i in ids), 2)
+        self.assertEqual(sum(i.startswith("E") for i in ids), 3)
+        self.assertTrue(out["overflow"].empty)
+        self.assertTrue(out["excedentes"].empty)
+
     def _profundidad(self, out, zona: str) -> float:
         ss = [s for s in out["slots"] if s["zona_layout"] == zona]
         return (max(s["y"] + s["d"] for s in ss) - min(s["y"] for s in ss)

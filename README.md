@@ -110,10 +110,71 @@ sólo altera cantidades y posición.
 El diseño se divide en tres vistas: análisis de mercancía, restricciones por
 zona y preparación de localidades. El plano es ahora la fuente principal del
 acomodo: una paleta muestra cada tipo, sus dimensiones X/Y/Z y su saldo; sobre
-el lienzo se coloca una localidad o se traza una corrida de uno o dos lados con
-pasillo. La validación de perímetro, zona permitida, obstáculos y traslapes se
-actualiza antes de guardar. Las restricciones de mercancía se heredan de la
-zona y pueden afinarse en el inspector de una localidad.
+el lienzo se coloca una localidad o se llena una franja completa de la zona con
+una línea, dos líneas y un pasillo, o cuatro líneas y dos pasillos. Cada corrida
+se recorta al polígono, respeta su margen y omite obstáculos y localidades ya
+existentes antes de crear el bloque. La validación de perímetro, zona permitida,
+obstáculos y traslapes se actualiza antes de guardar. Las restricciones de
+mercancía se heredan de la zona y pueden afinarse en el inspector.
+
+Durante la colocación y el movimiento, el editor muestra imanes contra rejilla,
+bordes y centros de zonas, localidades, obstáculos, accesos y perímetro. Las
+guías indican X/Y, tamaño de la huella y el elemento usado como referencia. En
+las corridas también se marcan inicio, fin y longitud útil de la zona. La
+tolerancia y el uso de centros se configuran en **Ayudas de precisión**; `Alt`
+desactiva el imán temporalmente para un ajuste libre.
+
+### Validar un acomodo de Rack Alto existente
+
+La ruta **Validar acomodo existente** importa un CSV con `QTY activo` y
+localidades propuestas sin volver a ejecutar el diseño automático. Interpreta
+una localidad repetida como propuesta Multi-SKU, valida conjuntamente el
+frente, profundidad y altura disponibles, y separa N01–N02 para surtido de
+N03–N05 para exceso.
+
+El importador reconoce las columnas por nombre, por lo que admite tanto el
+formato original como el que incorpora `unidades en activo`. `existencia` se
+conserva como inventario total; `unidades en activo` representa las piezas que
+deben caber conjuntamente en las localidades enumeradas por el SKU. El motor
+reparte esas piezas entre las propuestas sin superar su capacidad y bloquea la
+aprobación si la capacidad total resulta insuficiente. Valores como
+`No Ubicado` se tratan como una propuesta pendiente, no como un código físico.
+La diferencia `existencia - unidades en activo` se calcula como reserva y se
+asigna, por capacidad, a N03–N05 sobre las mismas posiciones de surtido. Se
+ocupa primero el nivel superior más cercano (N03) y el diagnóstico reporta
+cuántas piezas quedaron asignadas o sin espacio.
+
+El editor de rack combina selección por pasillo, bahía y lado con una
+elevación frontal de cinco niveles. Desde la misma vista se pueden modificar
+tipos y medidas, habilitar Multi-SKU, agregar o retirar códigos y crear o
+eliminar posiciones físicas. Los cambios permanecen como borrador hasta que
+el diagnóstico no tenga bloqueantes y el acomodo se apruebe para Operación.
+
+La etapa **Acomodo 3D** muestra la estructura completa por bahía, las
+localidades y la mercancía activa o de reserva dentro de su nivel. Permite
+orbitar, acercar, filtrar problemas y consultar SKU, dimensiones, existencias
+y capacidad por localidad. Su laboratorio representa las piezas individuales,
+incluidas las que el algoritmo declara que no caben: permite seleccionar una
+unidad, girarla sobre cualquiera de sus tres ejes, desplazarla y replicar la
+orientación encontrada al resto del SKU. Una alternativa sólo puede aplicarse si
+respeta dimensiones de mercancía, existencias, holguras, límites y colisiones;
+al aceptarla se recalcula el diagnóstico y se conserva con el resultado que
+pasa a simulación.
+
+Los racks se representan una sola vez por bahía completa mediante cuatro
+montantes exteriores, largueros por nivel y travesaños metálicos; no se dibuja
+una estructura independiente sobre cada localidad. Al seleccionar una localidad se configura la
+bahía a la que pertenece: frente total, profundidad y altura útil independiente
+para N01–N05. El ancho se redistribuye proporcionalmente entre sus posiciones;
+el cambio reconstruye la geometría y vuelve a validar las capacidades. El
+laboratorio conserva únicamente el volumen verde de la localidad y la mercancía.
+
+La distribución se abre en una página propia desde la tercera etapa de Diseño.
+Antes del plano concentra cuatro decisiones: unidades mínimas para dedicar una
+localidad, máximo de localidades regulares por SKU, zona especial para el
+excedente y separación física mínima. Los SKU por debajo del mínimo se agrupan
+en localidades multi-SKU compatibles; al superar el máximo, el asignador agota
+primero la capacidad regular y sólo entonces continúa en la zona especial.
 
 El XLSX queda como intercambio, auditoría y captura masiva. Conserva
 `Dashboard`, `Tipos_ubicacion`, `Mapa_preliminar` y `Mapa_restringido`; al
@@ -481,8 +542,9 @@ Una zona que falla no tumba el barrido: se reporta y se sigue.
   accesos y ubicaciones con selección y arrastre directos, ajuste a rejilla y
   alineación inteligente.
 - En la etapa de localidades hay paleta por tipo, orientación horizontal o
-  vertical, colocación individual, corridas paramétricas, selección múltiple,
-  rotación, duplicado, deshacer/rehacer y conteos de avance en vivo.
+  vertical, colocación individual, llenado por zona, patrones de pasillo simple
+  o doble, guías magnéticas con cotas, selección múltiple, rotación, duplicado,
+  deshacer/rehacer y conteos de avance en vivo.
 - Los rerenders de Streamlit conservan el borrador local hasta guardarlo o
   descartarlo explícitamente.
 - Los cambios permanecen como borrador hasta pulsar **Guardar layout**.
@@ -503,6 +565,7 @@ datos/compartidos/           Catálogos reutilizables entre centros
 datos/cedis/<CODIGO>/        Entradas, maestros y salidas de cada CEDIS
 pages/1_Datos.py             Datos, validación y selección del alcance
 pages/2_Diseno.py            Plano CAD, ubicaciones y resultado 2D/3D
+pages/2_Distribucion.py      Política por SKU y distribución física por zona
 pages/3_Operacion.py         Simulación, métodos, animación e interferencia
 pages/4_Escenarios.py        Versiones, comparación y descargas
 pages/1_Validacion_de_datos.py Calidad de datos auxiliar

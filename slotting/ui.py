@@ -115,7 +115,11 @@ def estado_flujo() -> dict[str, bool]:
     """Estado mínimo y compartido de las etapas operativas."""
     return {
         "datos": bool(st.session_state.get("alcance_confirmado", False)),
-        "diseno": bool(st.session_state.get("slots")),
+        "diseno": bool(st.session_state.get("slots")
+                       or st.session_state.get("res_slotfirst")
+                       or st.session_state.get("rack_validated_result")),
+        "validacion_acomodo": bool(
+            st.session_state.get("rack_validated_result")),
         # Simular la operación y comparar métodos es UN paso: la misma página
         # hace las dos cosas. Basta con que cualquiera de las dos haya corrido
         # para darlo por hecho.
@@ -224,6 +228,23 @@ def navegacion(actual: str | None = None) -> None:
                 st.caption(
                     ("→ " if clave == actual else "") + etiqueta_estado
                 )
+
+        st.divider()
+        st.caption("Ruta cuando ya existen localidades")
+        try:
+            st.page_link(
+                "pages/2_Validar_Acomodo.py",
+                label=("Validar acomodo existente  ✓"
+                       if estado["validacion_acomodo"]
+                       else "Validar acomodo existente"),
+                icon="✅",
+                disabled=actual == "validar_acomodo",
+            )
+        except (KeyError, TypeError):
+            st.caption(
+                ("→ " if actual == "validar_acomodo" else "")
+                + "Validar acomodo existente"
+            )
 
         st.divider()
         st.caption("Historial")

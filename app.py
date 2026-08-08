@@ -114,6 +114,26 @@ for tarjeta in tarjetas:
             disabled=tarjeta["disabled"],
         )
 
+st.markdown("### Ruta alternativa")
+st.caption(
+    "Si las localidades y sus SKU ya fueron propuestos, valida el archivo, "
+    "ajusta físicamente el rack y entra directamente a la evaluación operativa."
+)
+st.markdown(
+    '<div class="menu-card ready">'
+    '<div class="menu-kicker">Acomodo existente</div>'
+    '<div class="menu-title">Validar Rack Alto</div>'
+    '<div class="menu-copy">Importa QTY activo y ubicaciones propuestas, '
+    'revisa Multi-SKU y edita los cinco niveles en una elevación frontal.</div>'
+    '</div>',
+    unsafe_allow_html=True,
+)
+st.page_link(
+    "pages/2_Validar_Acomodo.py",
+    label="Abrir validación de acomodo existente",
+    icon="✅",
+)
+
 st.divider()
 st.markdown("### Historial")
 st.caption(

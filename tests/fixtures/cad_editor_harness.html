@@ -23,6 +23,8 @@ const args={ancho:30,largo:20,rejilla:.25,modo_localidades:true,
      estructura:'PISO',requeridas:8},
     {codigo:'RACK-M',nombre:'Rack medio',w:2.4,d:1.1,h:6,
      estructura:'RACK',requeridas:10}],
+  configuracion_localidades:{separacion_m:.05,zona_especial:'Rack',
+    tolerancia_iman_m:.2,mostrar_guias:true,imantar_centros:true},
   localidades_planificadas:[
     ...Array.from({length:8},(_,i)=>({id:`MOTO-${String(i+1).padStart(3,'0')}`,
       tipo_codigo:'MOTO-PISO',zona_layout:'Motos',w:2.2,d:.9})),

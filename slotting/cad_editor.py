@@ -14,6 +14,7 @@ _CAD = components.declare_component(
 def editor(perimetro, obstaculos, accesos, zonas, ubicaciones,
            ancho_m, largo_m, rejilla_m, *, tipos=None, catalogos=None,
            localidades_planificadas=None, presupuesto=None,
+           configuracion_localidades=None,
            modo_localidades: bool = False, key: str):
     return _CAD(mode="editor",
                 perimetro=perimetro or [], obstaculos=obstaculos or [],
@@ -23,5 +24,6 @@ def editor(perimetro, obstaculos, accesos, zonas, ubicaciones,
                 catalogos=catalogos or {},
                 localidades_planificadas=localidades_planificadas or [],
                 presupuesto=presupuesto or [],
+                configuracion_localidades=configuracion_localidades or {},
                 modo_localidades=bool(modo_localidades), height=860,
                 default=None, key=key)

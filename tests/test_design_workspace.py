@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from slotting.design_workspace import (ETAPAS, _indicadores_designacion,
+                                       _max_ubicaciones_por_sku,
+                                       _mercancia_excedente,
                                        _presupuesto_editor,
                                        _relaciones_sugeridas)
 
@@ -12,7 +15,12 @@ class TestFlujoMercanciaPrimero(unittest.TestCase):
     def test_el_flujo_respeta_el_orden_solicitado(self):
         self.assertEqual(ETAPAS, [
             "1 · Análisis de mercancía", "2 · Restricciones por zona",
-            "3 · Preparar localidades"])
+            "3 · Distribuir localidades"])
+
+    def test_distribucion_tiene_pagina_independiente(self):
+        page = Path(__file__).resolve().parents[1] / "pages" / "2_Distribucion.py"
+        self.assertTrue(page.is_file())
+        self.assertIn("render_distribucion", page.read_text(encoding="utf-8"))
 
     def test_un_sku_parcial_sigue_pendiente(self):
         requerimientos = [
@@ -64,6 +72,26 @@ class TestFlujoMercanciaPrimero(unittest.TestCase):
         self.assertEqual(out[0]["requeridas"], 2)
         self.assertEqual(out[1]["requeridas"], 1)
         self.assertEqual(out[1]["estructura"], "RACK")
+
+    def test_tope_regular_solo_se_aplica_a_sku_que_lo_excede(self):
+        requerimientos = [
+            {"sku": "A", "localidades_necesarias": 6},
+            {"sku": "B", "localidades_necesarias": 2},
+        ]
+        self.assertEqual(_max_ubicaciones_por_sku(requerimientos, 4), {"A": 4})
+
+    def test_mercancia_excedente_conserva_solo_unidades_especiales(self):
+        import pandas as pd
+
+        df = pd.DataFrame({"sku": ["A", "B"], "unidades": [20, 3]})
+        requerimientos = [
+            {"sku": "A", "unidades_zona_especial": 8},
+            {"sku": "B", "unidades_zona_especial": 0},
+        ]
+        out = _mercancia_excedente(df, requerimientos)
+        self.assertEqual(out[["sku", "unidades"]].to_dict("records"), [
+            {"sku": "A", "unidades": 8},
+        ])
 
 
 if __name__ == "__main__":

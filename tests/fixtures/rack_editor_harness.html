@@ -1,0 +1,11 @@
+<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Rack editor harness</title>
+<style>html,body,iframe{margin:0;width:100%;height:100%;border:0;background:#07101b}</style></head>
+<body><iframe id="rack" src="../../slotting/rack_editor_frontend/index.html"></iframe>
+<script>
+const frame=document.getElementById('rack');
+const levels=[1,2,3,4,5].map(n=>({nivel:n,rol:n<=2?'SURTIDO':'EXCESO',altura_util_cm:174,acceso:n<=2?'MANUAL':'EQUIPO'}));
+const types=[{tipo_codigo:'RA 1',longitud_cm:120,profundidad_cm:110,altura_cm:174,descripcion:'General'},{tipo_codigo:'RA 2',longitud_cm:60,profundidad_cm:110,altura_cm:174,descripcion:'Dos separadores'}];
+const locations=[];for(let level=1;level<=5;level++)for(let pos=1;pos<=3;pos++)locations.push({id:`RA-P01-B01-LI-N${String(level).padStart(2,'0')}-P${String(pos).padStart(2,'0')}`,parsed:true,area:'RA',pasillo:1,bahia:1,lado:'I',nivel:level,posicion:pos,rol:level<=2?'SURTIDO':'EXCESO',acceso:level<=2?'MANUAL':'EQUIPO',tipo_codigo:pos===2?'RA 2':'RA 1',longitud_cm:pos===2?60:120,profundidad_cm:110,altura_cm:174,skus:level===1&&pos===1?['697061','624918']:level===2&&pos===2?['147933']:[],multisku:level===1&&pos===1,generada:level>=3,status:'VALIDA'});
+const args={localidades:locations,niveles:levels,tipos:types,skus:[{sku:'697061',tipo_codigo:'RA 1'},{sku:'624918',tipo_codigo:'RA 1'},{sku:'147933',tipo_codigo:'RA 2'}]};
+window.addEventListener('message',e=>{if(e.data?.type==='streamlit:componentReady')frame.contentWindow.postMessage({type:'streamlit:render',args},'*')});
+</script></body></html>
